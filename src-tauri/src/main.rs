@@ -6,6 +6,7 @@ use std::net::TcpStream;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -39,6 +40,7 @@ struct DetectResult {
 
 struct DshProcess(Mutex<Option<Child>>);
 struct InstallProcess(Mutex<Option<i32>>); // 安装进程组 pid
+struct QuitFlag(AtomicBool); // 是否正在退出，用于抑制崩溃自动重启
 
 // ---------- 日志 ----------
 
@@ -121,6 +123,16 @@ command -v dsh"#;
     None
 }
 
+// 解析 nvm 目录名（如 v22.22.3）为数值，便于按 semver 排序
+fn version_key(v: &str) -> (u64, u64, u64) {
+    let v = v.trim_start_matches('v');
+    let mut it = v.split('.');
+    let major = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let minor = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let patch = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    (major, minor, patch)
+}
+
 fn find_dsh_candidates() -> Vec<PathBuf> {
     let mut candidates = Vec::new();
     if let Some(via_shell) = find_dsh_via_shell() {
@@ -135,7 +147,14 @@ fn find_dsh_candidates() -> Vec<PathBuf> {
                     .filter_map(|e| e.ok())
                     .map(|e| e.path())
                     .collect();
-                versions.sort();
+                // 按 semver 数值排序，避免字符串排序把 v9.x 排在 v22.x 前面
+                versions.sort_by_key(|p| {
+                    let name = p
+                        .file_name()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    version_key(&name)
+                });
                 versions.reverse();
                 for v in versions {
                     let p = v.join("bin").join("dsh");
@@ -317,6 +336,82 @@ fn start_dsh(dsh_path: &PathBuf, port: u16) -> Result<Child, String> {
         .map_err(|e| e.to_string())
 }
 
+// 带重试地启动 dsh web（固定端口，失败/超时则重试 attempts 次）
+fn start_dsh_with_retry(app: &tauri::AppHandle, dsh_path: &PathBuf, port: u16, attempts: u32) -> bool {
+    for i in 1..=attempts {
+        match start_dsh(dsh_path, port) {
+            Ok(child) => {
+                {
+                    let state = app.state::<DshProcess>();
+                    *state.0.lock().unwrap() = Some(child);
+                }
+                if wait_for_port(HOST, port, Duration::from_secs(20)) {
+                    return true;
+                }
+                emit_log(app, &format!("[dsh] 启动超时（第 {i}/{attempts} 次）"));
+                if let Some(mut c) = app.state::<DshProcess>().0.lock().unwrap().take() {
+                    let _ = c.kill();
+                }
+            }
+            Err(e) => {
+                emit_log(app, &format!("[dsh] 启动失败（第 {i}/{attempts} 次）: {e}"));
+            }
+        }
+    }
+    false
+}
+
+// 监控 dsh 进程，崩溃后自动重启（复用同一端口，窗口无需刷新）
+fn monitor_dsh(app: tauri::AppHandle, dsh_path: PathBuf, port: u16) {
+    let mut restarts = 0u32;
+    let mut window_start = Instant::now();
+    loop {
+        // 等待当前进程退出（或被退出流程清理）
+        loop {
+            let state = app.state::<DshProcess>();
+            let mut guard = state.0.lock().unwrap();
+            let exited = match guard.as_mut() {
+                None => true,
+                Some(c) => match c.try_wait() {
+                    Ok(Some(_)) => true,
+                    Ok(None) => false,
+                    Err(_) => true,
+                },
+            };
+            drop(guard);
+            if exited {
+                break;
+            }
+            thread::sleep(Duration::from_millis(300));
+        }
+
+        {
+            let state = app.state::<DshProcess>();
+            *state.0.lock().unwrap() = None;
+        }
+
+        if app.state::<QuitFlag>().0.load(Ordering::SeqCst) {
+            return;
+        }
+
+        // 连续崩溃保护：60 秒内最多自动重启 3 次
+        if window_start.elapsed() > Duration::from_secs(60) {
+            restarts = 0;
+            window_start = Instant::now();
+        }
+        restarts += 1;
+        if restarts > 3 {
+            emit_log(&app, "[dsh] 连续崩溃过多，停止自动重启，请手动重启应用");
+            return;
+        }
+        emit_log(&app, &format!("[dsh] 进程退出，自动重启（第 {restarts} 次）..."));
+        if !start_dsh_with_retry(&app, &dsh_path, port, 1) {
+            emit_log(&app, "[dsh] 自动重启失败");
+            return;
+        }
+    }
+}
+
 // 终止整个安装进程组（bash + npm 子进程），避免残留孤儿进程
 fn kill_install_group(app: &tauri::AppHandle) {
     let state = app.state::<InstallProcess>();
@@ -461,10 +556,12 @@ fn launch_main(app: &tauri::AppHandle) {
     let mut port = PORT;
     if let Some(path) = dsh_path {
         port = find_free_port(PORT);
-        if let Ok(child) = start_dsh(&path, port) {
-            let state = app.state::<DshProcess>();
-            *state.0.lock().unwrap() = Some(child);
-            let _ = wait_for_port(HOST, port, Duration::from_secs(20));
+        if start_dsh_with_retry(app, &path, port, 3) {
+            let app_clone = app.clone();
+            let path_clone = path.clone();
+            thread::spawn(move || monitor_dsh(app_clone, path_clone, port));
+        } else {
+            emit_log(app, "[dsh] 多次启动失败，dsh web 可能无法正常使用");
         }
     }
 
@@ -493,6 +590,7 @@ fn main() {
         }))
         .manage(DshProcess(Mutex::new(None)))
         .manage(InstallProcess(Mutex::new(None)))
+        .manage(QuitFlag(AtomicBool::new(false)))
         .invoke_handler(tauri::generate_handler![
             get_detect_result,
             install_dsh,
@@ -514,6 +612,7 @@ fn main() {
         .expect("error while building tauri application")
         .run(|app_handle, event| {
             if let tauri::RunEvent::Exit = event {
+                app_handle.state::<QuitFlag>().0.store(true, Ordering::SeqCst);
                 kill_install_group(app_handle);
                 let state = app_handle.state::<DshProcess>();
                 let child = state.0.lock().unwrap().take();
