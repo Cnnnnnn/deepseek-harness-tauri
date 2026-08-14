@@ -8,13 +8,12 @@
 
 ```bash
 npm install
-npx tauri dev                                      # 开发
-npx tauri build                                    # 打包当前架构
-npx tauri build --target x86_64-apple-darwin       # Intel
+npx tauri dev                      # 开发
+bash scripts/build-universal.sh    # 打包 universal（zip + dmg）
 ```
 
 ## 下载
 
-- **macOS**（Intel + Apple Silicon 通用）：[DeepSeek.Harness-universal-mac.zip](https://github.com/Cnnnnnn/deepseek-harness-tauri/releases/latest/download/DeepSeek.Harness-universal-mac.zip)
+- **macOS**（Intel + Apple Silicon 通用，推荐 DMG）：[DeepSeek.Harness-universal-mac.dmg](https://github.com/Cnnnnnn/deepseek-harness-tauri/releases/latest/download/DeepSeek.Harness-universal-mac.dmg)（或 [zip](https://github.com/Cnnnnnn/deepseek-harness-tauri/releases/latest/download/DeepSeek.Harness-universal-mac.zip)）
 
 历史版本见 [Releases](https://github.com/Cnnnnnn/deepseek-harness-tauri/releases)。

@@ -272,7 +272,9 @@ export REG="{registry}"
 export MIRROR="{mirror}"
 export DSH_PKG="{dsh_pkg}"
 log() {{ echo "[install] $*"; }}
+stage() {{ echo "[install:stage] $1"; }}
 
+stage node
 if [ -s "$NVM_DIR/nvm.sh" ]; then
   . "$NVM_DIR/nvm.sh"
   log "检测到 nvm，安装/使用 Node 22 ..."
@@ -287,6 +289,7 @@ else
   exit 1
 fi
 
+stage install
 log "安装 $DSH_PKG ..."
 
 mkdir -p "$HOME/.local/npm-cache" "$HOME/.local"
@@ -306,6 +309,7 @@ else
   npm i -g --prefix="$HOME/.local" "$DSH_PKG" --registry="$MIRROR"
 fi
 
+stage verify
 log "验证安装 ..."
 export PATH="$HOME/.local/bin:$PATH"
 if command -v dsh >/dev/null 2>&1; then

@@ -61,6 +61,10 @@
     .status { font-size: 13px; margin-top: 10px; min-height: 18px; }
     .status.ok { color: #059669; }
     .status.fail { color: #dc2626; }
+    #progress { display: none; margin-top: 14px; }
+    .progress-label { font-size: 12px; color: #6b7280; margin-bottom: 6px; }
+    .progress-track { background: #e5e7eb; border-radius: 4px; height: 8px; overflow: hidden; }
+    #progress-bar { background: #2563eb; height: 100%; width: 0%; transition: width 0.3s ease; }
     #cmd {
       margin-top: 14px;
       background: #f3f4f6;
@@ -88,6 +92,11 @@
   <div class="cmd-label">手动安装命令（也可复制到终端执行）：</div>
   <div id="cmd"></div>
 
+  <div id="progress">
+    <div class="progress-label">准备安装…</div>
+    <div class="progress-track"><div id="progress-bar"></div></div>
+  </div>
+
   <div id="log"></div>
   <div id="status" class="status"></div>
 
@@ -109,8 +118,27 @@
       const installBtn = document.getElementById('install');
       const copyBtn = document.getElementById('copy');
       const cancelBtn = document.getElementById('cancel');
+      const progressEl = document.getElementById('progress');
+      const progressBarEl = document.getElementById('progress-bar');
+      const progressLabelEl = progressEl.querySelector('.progress-label');
+
+      const STAGES = {
+        node: { label: '准备 Node 22', pct: 25 },
+        install: { label: '安装 dsh', pct: 65 },
+        verify: { label: '验证安装', pct: 90 },
+      };
 
       let installCmd = '';
+
+      function handleStage(text) {
+        const m = /\[install:stage\]\s*(\S+)/.exec(text);
+        if (m && STAGES[m[1]]) {
+          const s = STAGES[m[1]];
+          progressEl.style.display = 'block';
+          progressLabelEl.textContent = s.label;
+          progressBarEl.style.width = s.pct + '%';
+        }
+      }
 
       function renderProblems(problems) {
         problemsEl.innerHTML = '';
@@ -130,9 +158,13 @@
       }
 
       function appendLog(text) {
-        logEl.style.display = 'block';
-        logEl.textContent += text;
-        logEl.scrollTop = logEl.scrollHeight;
+        handleStage(text);
+        const display = String(text).replace(/\[install:stage\]\s*\S+\s*\r?\n?/g, '');
+        if (display) {
+          logEl.style.display = 'block';
+          logEl.textContent += display;
+          logEl.scrollTop = logEl.scrollHeight;
+        }
       }
 
       function setBusy(busy) {
@@ -202,6 +234,9 @@
       installBtn.addEventListener('click', () => {
         logEl.textContent = '';
         logEl.style.display = 'block';
+        progressBarEl.style.width = '0%';
+        progressLabelEl.textContent = '准备安装…';
+        progressEl.style.display = 'none';
         setStatus('');
         setBusy(true);
         appendLog('开始自动安装，请稍候（需联网，可能耗时数分钟）…\n');

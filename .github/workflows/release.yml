@@ -21,25 +21,15 @@ jobs:
           node-version: 22
       - name: Install Tauri CLI
         run: npm ci
-      - name: Build arm64
-        run: npx tauri build --target aarch64-apple-darwin
-      - name: Build x86_64
-        run: npx tauri build --target x86_64-apple-darwin
-      - name: Make universal app and zip
-        run: |
-          ARM64="src-tauri/target/aarch64-apple-darwin/release/bundle/macos/DeepSeek Harness.app"
-          X64="src-tauri/target/x86_64-apple-darwin/release/bundle/macos/DeepSeek Harness.app"
-          UNI="src-tauri/target/universal-apple-darwin/release/bundle/macos/DeepSeek Harness.app"
-          mkdir -p "$(dirname "$UNI")"
-          cp -R "$ARM64" "$UNI"
-          lipo -create "$ARM64/Contents/MacOS/dsh-tauri" "$X64/Contents/MacOS/dsh-tauri" -output "$UNI/Contents/MacOS/dsh-tauri"
-          codesign --force --deep --sign - "$UNI"
-          ditto -c -k --keepParent "$UNI" "DeepSeek.Harness-universal-mac.zip"
+      - name: Build universal app (arm64 + x86_64 → lipo → zip + dmg)
+        run: bash scripts/build-universal.sh
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: mac-universal
-          path: DeepSeek.Harness-universal-mac.zip
+          path: |
+            DeepSeek.Harness-universal-mac.zip
+            DeepSeek.Harness-universal-mac.dmg
 
   release:
     needs: [build-macos]
@@ -52,4 +42,6 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
-          files: artifacts/mac-universal/DeepSeek.Harness-universal-mac.zip
+          files: |
+            artifacts/mac-universal/DeepSeek.Harness-universal-mac.zip
+            artifacts/mac-universal/DeepSeek.Harness-universal-mac.dmg

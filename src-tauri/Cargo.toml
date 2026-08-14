@@ -1,6 +1,6 @@
 [package]
 name = "dsh-tauri"
-version = "1.0.2"
+version = "1.0.3"
 description = "DeepSeek Harness (dsh) Tauri 封装"
 authors = ["shienliang"]
 edition = "2021"
