@@ -15,4 +15,6 @@ npx tauri build --target x86_64-apple-darwin       # Intel
 
 ## 下载
 
-预编译产物见 [Releases](../../releases)。
+- **macOS**（Intel + Apple Silicon 通用）：[DeepSeek.Harness-universal-mac.zip](https://github.com/Cnnnnnn/deepseek-harness-tauri/releases/latest/download/DeepSeek.Harness-universal-mac.zip)
+
+历史版本见 [Releases](https://github.com/Cnnnnnn/deepseek-harness-tauri/releases)。
