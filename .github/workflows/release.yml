@@ -20,7 +20,7 @@ jobs:
         with:
           node-version: 22
       - name: Install Tauri CLI
-        run: npm install
+        run: npm ci
       - name: Build arm64
         run: npx tauri build --target aarch64-apple-darwin
       - name: Build x86_64
