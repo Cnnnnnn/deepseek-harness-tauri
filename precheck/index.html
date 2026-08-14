@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <title>DeepSeek Harness 环境检查</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Helvetica Neue", sans-serif;
+      background: #f6f7f9;
+      color: #1f2329;
+      padding: 24px 28px;
+      -webkit-user-select: none;
+      user-select: none;
+    }
+    h1 { font-size: 18px; font-weight: 600; margin-bottom: 6px; }
+    .sub { font-size: 13px; color: #6b7280; margin-bottom: 18px; }
+    .problem {
+      background: #fff;
+      border: 1px solid #e5e7eb;
+      border-left: 4px solid #f59e0b;
+      border-radius: 8px;
+      padding: 14px 16px;
+      margin-bottom: 10px;
+    }
+    .problem .ptitle { font-size: 14px; font-weight: 600; color: #b45309; margin-bottom: 4px; }
+    .problem .pdetail { font-size: 13px; color: #4b5563; line-height: 1.5; }
+    #log {
+      background: #111827;
+      color: #d1d5db;
+      font-family: "SF Mono", Menlo, Consolas, monospace;
+      font-size: 12px;
+      line-height: 1.6;
+      border-radius: 8px;
+      padding: 12px 14px;
+      height: 180px;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      word-break: break-all;
+      margin-top: 14px;
+      display: none;
+      -webkit-user-select: text;
+      user-select: text;
+    }
+    .actions { margin-top: 16px; display: flex; gap: 10px; }
+    button {
+      font-size: 13px;
+      border-radius: 6px;
+      padding: 8px 18px;
+      border: 1px solid transparent;
+      cursor: pointer;
+      font-weight: 500;
+    }
+    #install { background: #2563eb; color: #fff; }
+    #install:hover { background: #1d4ed8; }
+    #install:disabled { background: #93c5fd; cursor: not-allowed; }
+    #copy { background: #fff; color: #1f2329; border-color: #d1d5db; }
+    #copy:hover { background: #f3f4f6; }
+    #cancel { background: transparent; color: #6b7280; }
+    #cancel:hover { color: #1f2329; }
+    .status { font-size: 13px; margin-top: 10px; min-height: 18px; }
+    .status.ok { color: #059669; }
+    .status.fail { color: #dc2626; }
+    #cmd {
+      margin-top: 14px;
+      background: #f3f4f6;
+      border: 1px solid #e5e7eb;
+      border-radius: 8px;
+      padding: 12px 14px;
+      font-family: "SF Mono", Menlo, Consolas, monospace;
+      font-size: 12px;
+      line-height: 1.7;
+      white-space: pre-wrap;
+      word-break: break-all;
+      color: #374151;
+      -webkit-user-select: text;
+      user-select: text;
+    }
+    .cmd-label { font-size: 12px; color: #6b7280; margin: 14px 0 6px; }
+  </style>
+</head>
+<body>
+  <h1>DeepSeek Harness 环境检查</h1>
+  <div class="sub">检测到以下环境问题，需要处理后才能启动应用。</div>
+
+  <div id="problems"></div>
+
+  <div class="cmd-label">手动安装命令（也可复制到终端执行）：</div>
+  <div id="cmd"></div>
+
+  <div id="log"></div>
+  <div id="status" class="status"></div>
+
+  <div class="actions">
+    <button id="install">一键安装</button>
+    <button id="copy">复制命令</button>
+    <button id="cancel">取消</button>
+  </div>
+
+  <script>
+    (function () {
+      const { invoke } = window.__TAURI__.core;
+      const { listen } = window.__TAURI__.event;
+
+      const problemsEl = document.getElementById('problems');
+      const cmdEl = document.getElementById('cmd');
+      const logEl = document.getElementById('log');
+      const statusEl = document.getElementById('status');
+      const installBtn = document.getElementById('install');
+      const copyBtn = document.getElementById('copy');
+      const cancelBtn = document.getElementById('cancel');
+
+      let installCmd = '';
+
+      function renderProblems(problems) {
+        problemsEl.innerHTML = '';
+        for (const p of problems) {
+          const div = document.createElement('div');
+          div.className = 'problem';
+          const t = document.createElement('div');
+          t.className = 'ptitle';
+          t.textContent = p.title;
+          const d = document.createElement('div');
+          d.className = 'pdetail';
+          d.textContent = p.detail || '';
+          div.appendChild(t);
+          div.appendChild(d);
+          problemsEl.appendChild(div);
+        }
+      }
+
+      function appendLog(text) {
+        logEl.style.display = 'block';
+        logEl.textContent += text;
+        logEl.scrollTop = logEl.scrollHeight;
+      }
+
+      function setBusy(busy) {
+        installBtn.disabled = busy;
+        installBtn.textContent = busy ? '安装中…' : '一键安装';
+      }
+
+      function setStatus(text, ok) {
+        statusEl.textContent = text;
+        statusEl.className = 'status ' + (ok === true ? 'ok' : ok === false ? 'fail' : '');
+      }
+
+      function copyText(text) {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(text).then(
+            () => setStatus('命令已复制到剪贴板', true),
+            () => fallbackCopy(text)
+          );
+        } else {
+          fallbackCopy(text);
+        }
+      }
+
+      function fallbackCopy(text) {
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.style.position = 'fixed';
+        ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.select();
+        try {
+          document.execCommand('copy');
+          setStatus('命令已复制到剪贴板', true);
+        } catch (e) {
+          setStatus('复制失败，请手动选择复制', false);
+        }
+        document.body.removeChild(ta);
+      }
+
+      // 初始化：获取检测结果
+      invoke('get_detect_result')
+        .then((result) => {
+          installCmd = result.install_cmd || '';
+          cmdEl.textContent = installCmd;
+          renderProblems(result.problems || []);
+        })
+        .catch((e) => {
+          setStatus('获取检测结果失败：' + e, false);
+        });
+
+      // 安装日志
+      listen('install_log', (event) => {
+        appendLog(String(event.payload || ''));
+      });
+
+      // 安装完成
+      listen('install_done', (event) => {
+        const payload = event.payload || {};
+        setBusy(false);
+        if (payload.success) {
+          setStatus('安装完成，正在启动…', true);
+        } else {
+          setStatus(payload.message || '安装失败', false);
+        }
+      });
+
+      installBtn.addEventListener('click', () => {
+        logEl.textContent = '';
+        logEl.style.display = 'block';
+        setStatus('');
+        setBusy(true);
+        appendLog('开始自动安装，请稍候（需联网，可能耗时数分钟）…\n');
+        invoke('install_dsh').catch((e) => {
+          setBusy(false);
+          setStatus('安装命令调用失败：' + e, false);
+        });
+      });
+
+      copyBtn.addEventListener('click', () => {
+        copyText(installCmd);
+      });
+
+      cancelBtn.addEventListener('click', () => {
+        invoke('cancel_precheck');
+      });
+    })();
+  </script>
+</body>
+</html>
