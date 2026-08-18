@@ -18,7 +18,7 @@ const PORT: u16 = 3080;
 const NPM_REGISTRY: &str = "https://registry.npmjs.org";
 const NPM_MIRROR: &str = "https://registry.npmmirror.com";
 // 固定已验证的 dsh 版本，避免上游发破坏性新版本
-const DSH_PKG: &str = "@deepseek-ai/dsh@0.1.0-rc.6";
+const DSH_PKG: &str = "@deepseek-ai/dsh@0.1.0-rc.7";
 const INSTALL_TIMEOUT_SECS: u64 = 15 * 60;
 
 // ---------- 数据结构 ----------
