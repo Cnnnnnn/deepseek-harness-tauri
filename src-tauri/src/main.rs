@@ -558,9 +558,9 @@ fn launch_main(app: &tauri::AppHandle) {
         .find(|c| run_dsh_version(c).is_some());
 
     let mut port = PORT;
-    if let Some(path) = dsh_path {
+    if let Some(path) = &dsh_path {
         port = find_free_port(PORT);
-        if start_dsh_with_retry(app, &path, port, 3) {
+        if start_dsh_with_retry(app, path, port, 3) {
             let app_clone = app.clone();
             let path_clone = path.clone();
             thread::spawn(move || monitor_dsh(app_clone, path_clone, port));
@@ -569,15 +569,47 @@ fn launch_main(app: &tauri::AppHandle) {
         }
     }
 
-    let _ = WebviewWindowBuilder::new(
+    // 捕获真实运行的 dsh 版本，用于在界面上显示，方便确认当前版本
+    let dsh_version = dsh_path
+        .as_ref()
+        .and_then(run_dsh_version)
+        .unwrap_or_else(|| "未知".to_string());
+
+    let win = WebviewWindowBuilder::new(
         app,
         "main",
         WebviewUrl::External(format!("http://{HOST}:{port}").parse().unwrap()),
     )
-    .title("DeepSeek Harness")
+    .title(format!("DeepSeek Harness · dsh {dsh_version}"))
     .inner_size(1280.0, 820.0)
     .on_navigation(|url| url.host_str() == Some(HOST))
     .build();
+
+    // 在 dsh web 页面注入常驻角标，显示当前 dsh 版本（自修复：应对 SPA 重渲染）
+    if let Ok(_win) = win {
+        let ver = dsh_version.clone();
+        let app2 = app.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(1500));
+            let app_for_closure = app2.clone();
+            let _ = app2.run_on_main_thread(move || {
+                if let Some(w) = app_for_closure.get_webview_window("main") {
+                    let badge_js = [
+                        "(function(){function e(){var b=document.getElementById('dsh-version-badge');",
+                        "if(!b){b=document.createElement('div');b.id='dsh-version-badge';",
+                        "b.textContent='dsh ", ver.as_str(), "';",
+                        "b.style.cssText='position:fixed;right:10px;bottom:10px;z-index:2147483647;",
+                        "background:rgba(15,23,42,.82);color:#e2e8f0;",
+                        "font:12px -apple-system,BlinkMacSystemFont,sans-serif;padding:4px 9px;",
+                        "border-radius:6px;pointer-events:none;box-shadow:0 1px 4px rgba(0,0,0,.35)';}",
+                        "}(document.body||document.documentElement).appendChild(b);}e();setInterval(e,1000);})();",
+                    ]
+                    .concat();
+                    let _ = w.eval(badge_js);
+                }
+            });
+        });
+    }
 }
 
 // ---------- 主流程 ----------
