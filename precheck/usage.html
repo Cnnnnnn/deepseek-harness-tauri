@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <title>用量统计</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Helvetica Neue", sans-serif;
+      background: #f6f7f9;
+      color: #1f2329;
+      padding: 22px 26px 30px;
+      -webkit-user-select: none;
+      user-select: none;
+    }
+    h1 { font-size: 18px; font-weight: 600; margin-bottom: 4px; }
+    .sub { font-size: 12px; color: #6b7280; margin-bottom: 16px; }
+    .cards { display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; margin-bottom: 16px; }
+    .card {
+      background: #fff; border: 1px solid #e5e7eb; border-radius: 10px; padding: 12px 14px;
+    }
+    .card .k { font-size: 12px; color: #6b7280; margin-bottom: 4px; }
+    .card .v { font-size: 19px; font-weight: 700; color: #111827; }
+    .card .u { font-size: 11px; color: #9ca3af; }
+    .card.accent { background: #eff6ff; border-color: #bfdbfe; }
+    .card.accent .v { color: #1d4ed8; }
+    .section { background: #fff; border: 1px solid #e5e7eb; border-radius: 10px; padding: 14px 16px; margin-bottom: 14px; }
+    .section h2 { font-size: 14px; font-weight: 600; margin-bottom: 10px; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { text-align: right; padding: 7px 8px; border-bottom: 1px solid #f0f1f3; }
+    th:first-child, td:first-child { text-align: left; }
+    thead th { color: #6b7280; font-weight: 600; font-size: 12px; }
+    tbody tr:hover { background: #f9fafb; }
+    .muted { color: #9ca3af; }
+    .err { background: #fef2f2; border: 1px solid #fecaca; color: #b91c1c; border-radius: 8px; padding: 10px 12px; font-size: 12px; margin-bottom: 12px; white-space: pre-wrap; }
+    .loading { color: #6b7280; font-size: 13px; padding: 20px 0; }
+    .bar { height: 6px; border-radius: 3px; background: #dbeafe; overflow: hidden; }
+    .bar > i { display: block; height: 100%; background: #2563eb; }
+    .row-model td:first-child { font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <h1>用量统计</h1>
+  <div class="sub" id="sub">聚合自 ~/.dsh/sessions 的本地会话日志（zstd 压缩）</div>
+
+  <div id="errors"></div>
+  <div id="content" style="display:none">
+    <div class="cards">
+      <div class="card"><div class="k">输入 Token</div><div class="v" id="t-input">-</div><div class="u">input</div></div>
+      <div class="card"><div class="k">输出 Token</div><div class="v" id="t-output">-</div><div class="u">output</div></div>
+      <div class="card"><div class="k">缓存读取</div><div class="v" id="t-cache">-</div><div class="u">cache read</div></div>
+      <div class="card"><div class="k">推理 Token</div><div class="v" id="t-reason">-</div><div class="u">reasoning</div></div>
+      <div class="card accent"><div class="k">估算费用</div><div class="v" id="t-cost">-</div><div class="u" id="t-cost-u">USD（参考）</div></div>
+    </div>
+
+    <div class="section">
+      <h2>剩余余额</h2>
+      <div id="balance" class="muted">获取中…</div>
+    </div>
+
+    <div class="section">
+      <h2>按模型拆分</h2>
+      <table>
+        <thead><tr><th>模型</th><th>调用</th><th>输入</th><th>输出</th><th>缓存读</th><th>推理</th></tr></thead>
+        <tbody id="by-model"></tbody>
+      </table>
+    </div>
+
+    <div class="section">
+      <h2>按会话 / 项目拆分</h2>
+      <table>
+        <thead><tr><th>项目 / 会话</th><th>调用</th><th>输入</th><th>输出</th><th>缓存读</th><th>推理</th></tr></thead>
+        <tbody id="by-session"></tbody>
+      </table>
+    </div>
+  </div>
+  <div id="loading" class="loading">加载中…</div>
+
+  <script>
+    (function () {
+      const { invoke } = window.__TAURI__.core;
+
+      const fmt = (n) => (n == null ? '-' : Number(n).toLocaleString('en-US'));
+      const maxOf = (arr, sel) => arr.reduce((m, x) => Math.max(m, sel(x)), 0) || 1;
+
+      function render(data) {
+        document.getElementById('loading').style.display = 'none';
+        document.getElementById('content').style.display = 'block';
+
+        const t = data.total || {};
+        document.getElementById('t-input').textContent = fmt(t.input);
+        document.getElementById('t-output').textContent = fmt(t.output);
+        document.getElementById('t-cache').textContent = fmt(t.cache_read);
+        document.getElementById('t-reason').textContent = fmt(t.reasoning);
+        const cost = (data.estimated_cost_usd || 0);
+        document.getElementById('t-cost').textContent = '$' + cost.toFixed(4);
+        document.getElementById('sub').textContent =
+          '聚合自 ~/.dsh/sessions：' + (data.session_count || 0) + ' 个会话 / ' +
+          (data.scanned_files || 0) + ' 个日志文件';
+
+        // 余额
+        const balEl = document.getElementById('balance');
+        if (data.balance && data.balance.total_balance != null) {
+          balEl.innerHTML = '<b>' + escapeHtml(data.balance.total_balance) + ' ' +
+            escapeHtml(data.balance.currency || 'USD') + '</b> （来自 DeepSeek 账户接口）';
+          balEl.className = '';
+        } else {
+          balEl.textContent = '无法获取（需联网，且 ~/.dsh/.credentials.yaml 含有效 DEEPSEEK_API_KEY）';
+          balEl.className = 'muted';
+        }
+
+        // 按模型
+        const bm = data.by_model || [];
+        const bmBody = document.getElementById('by-model');
+        bmBody.innerHTML = '';
+        const maxModel = maxOf(bm, (m) => m.input + m.output + m.cache_read + m.reasoning);
+        for (const m of bm) {
+          const tr = document.createElement('tr');
+          tr.className = 'row-model';
+          const tot = m.input + m.output + m.cache_read + m.reasoning;
+          tr.innerHTML =
+            '<td>' + escapeHtml(m.model || '未知') +
+            ' <span class="bar" style="display:inline-block;width:80px;vertical-align:middle"><i style="width:' +
+            Math.round((tot / maxModel) * 100) + '%"></i></span></td>' +
+            '<td>' + fmt(m.calls) + '</td>' +
+            '<td>' + fmt(m.input) + '</td>' +
+            '<td>' + fmt(m.output) + '</td>' +
+            '<td>' + fmt(m.cache_read) + '</td>' +
+            '<td>' + fmt(m.reasoning) + '</td>';
+          bmBody.appendChild(tr);
+        }
+        if (bm.length === 0) bmBody.innerHTML = '<tr><td colspan="6" class="muted">无数据</td></tr>';
+
+        // 按会话
+        const bs = data.by_session || [];
+        const bsBody = document.getElementById('by-session');
+        bsBody.innerHTML = '';
+        const maxSess = maxOf(bs, (s) => s.input + s.output + s.cache_read + s.reasoning);
+        for (const s of bs) {
+          const tr = document.createElement('tr');
+          const tot = s.input + s.output + s.cache_read + s.reasoning;
+          const label = (s.workspace || '?') + ' / ' + (s.session_id || '?');
+          tr.innerHTML =
+            '<td title="' + escapeHtml(s.session_id || '') + '">' + escapeHtml(label) +
+            ' <span class="bar" style="display:inline-block;width:80px;vertical-align:middle"><i style="width:' +
+            Math.round((tot / maxSess) * 100) + '%"></i></span></td>' +
+            '<td>' + fmt(s.calls) + '</td>' +
+            '<td>' + fmt(s.input) + '</td>' +
+            '<td>' + fmt(s.output) + '</td>' +
+            '<td>' + fmt(s.cache_read) + '</td>' +
+            '<td>' + fmt(s.reasoning) + '</td>';
+          bsBody.appendChild(tr);
+        }
+        if (bs.length === 0) bsBody.innerHTML = '<tr><td colspan="6" class="muted">无数据</td></tr>';
+
+        // 错误
+        const errEl = document.getElementById('errors');
+        if (data.errors && data.errors.length) {
+          errEl.className = 'err';
+          errEl.textContent = '部分文件解析失败：\n' + data.errors.slice(0, 5).join('\n');
+        }
+      }
+
+      function escapeHtml(s) {
+        return String(s == null ? '' : s)
+          .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+          .replace(/"/g, '&quot;');
+      }
+
+      invoke('get_usage_stats')
+        .then(render)
+        .catch((e) => {
+          document.getElementById('loading').textContent = '加载失败：' + e;
+        });
+    })();
+  </script>
+</body>
+</html>

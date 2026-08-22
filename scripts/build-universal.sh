@@ -17,6 +17,9 @@ mkdir -p "$(dirname "$UNI")"
 rm -rf "$UNI"
 cp -R "$ARM64" "$UNI"
 lipo -create "$ARM64/Contents/MacOS/dsh-tauri" "$X64/Contents/MacOS/dsh-tauri" -output "$UNI/Contents/MacOS/dsh-tauri"
+# Tauri 在 tauri build 时不会把前端(precheck/)打进 bundle，这里手动补拷，
+# 否则 WebviewUrl::App("index.html"/"usage.html") 在打包后的 app 里加载不到。
+cp -R precheck/. "$UNI/Contents/Resources/"
 codesign --force --deep --sign - "$UNI"
 
 echo "[build] 生成 zip ..."

@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
@@ -11,6 +12,7 @@ use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use tauri::menu::{Menu, MenuItem};
 use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 
 const HOST: &str = "127.0.0.1";
@@ -18,7 +20,7 @@ const PORT: u16 = 3080;
 const NPM_REGISTRY: &str = "https://registry.npmjs.org";
 const NPM_MIRROR: &str = "https://registry.npmmirror.com";
 // 固定已验证的 dsh 版本，避免上游发破坏性新版本
-const DSH_PKG: &str = "@deepseek-ai/dsh@0.1.0-rc.7";
+const DSH_PKG: &str = "@deepseek-ai/dsh@0.1.1-rc.2";
 const INSTALL_TIMEOUT_SECS: u64 = 15 * 60;
 
 // ---------- 数据结构 ----------
@@ -207,6 +209,26 @@ fn run_dsh_version(dsh_path: &PathBuf) -> Option<String> {
     None
 }
 
+// 选择 dsh：优先匹配目标版本（DSH_PKG 中的版本号，如 0.1.0-rc.7），
+// 避免 PATH 中靠前的旧版（如 rc.6）被误选；无匹配版本时退回第一个能运行的。
+fn select_dsh() -> Option<PathBuf> {
+    let target = DSH_PKG.split('@').last().unwrap_or("").trim();
+    let candidates = find_dsh_candidates();
+    let mut first_working: Option<PathBuf> = None;
+    for c in &candidates {
+        if let Some(ver) = run_dsh_version(c) {
+            if first_working.is_none() {
+                first_working = Some(c.clone());
+            }
+            // 版本输出形如 "0.1.0-rc.7"，兼容可能的 "v" 前缀或前后空白
+            if ver.trim_start_matches('v').trim() == target {
+                return Some(c.clone());
+            }
+        }
+    }
+    first_working
+}
+
 fn manual_install_cmd() -> String {
     format!(
         r#"export NVM_DIR="$HOME/.nvm"
@@ -332,7 +354,8 @@ fn start_dsh(dsh_path: &PathBuf, port: u16) -> Result<Child, String> {
         path_env = format!("{}:{}", path_env, existing);
     }
     Command::new(dsh_path)
-        .args(["web", "--host", HOST, "--port", &port.to_string()])
+        // rc.8 起 dsh web 默认自动打开系统浏览器，封装使用内嵌 webview，必须禁用
+        .args(["web", "--host", HOST, "--port", &port.to_string(), "--no-open"])
         .env("PATH", path_env)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -552,10 +575,374 @@ fn cancel_precheck(app: tauri::AppHandle) {
     app.exit(0);
 }
 
+// ---------- 用量统计（聚合 ~/.dsh/sessions 下的 zstd 压缩会话日志） ----------
+
+#[derive(Clone, serde::Serialize)]
+struct TokenBreakdown {
+    input: u64,
+    output: u64,
+    cache_read: u64,
+    reasoning: u64,
+    total: u64,
+}
+
+#[derive(Clone, serde::Serialize)]
+struct ModelStat {
+    model: String,
+    input: u64,
+    output: u64,
+    cache_read: u64,
+    reasoning: u64,
+    calls: u64,
+}
+
+#[derive(Clone, serde::Serialize)]
+struct SessionStat {
+    workspace: String,
+    session_id: String,
+    input: u64,
+    output: u64,
+    cache_read: u64,
+    reasoning: u64,
+    calls: u64,
+}
+
+#[derive(Clone, serde::Serialize)]
+struct BalanceInfo {
+    total_balance: String,
+    currency: String,
+}
+
+#[derive(Clone, serde::Serialize)]
+struct UsageStats {
+    total: TokenBreakdown,
+    by_model: Vec<ModelStat>,
+    by_session: Vec<SessionStat>,
+    estimated_cost_usd: f64,
+    balance: Option<BalanceInfo>,
+    session_count: usize,
+    scanned_files: usize,
+    errors: Vec<String>,
+}
+
+struct FileAgg {
+    input: u64,
+    output: u64,
+    cache_read: u64,
+    reasoning: u64,
+    calls: u64,
+    by_model: BTreeMap<String, ModelStat>,
+}
+
+// 从 "key":"value" 形式的文本中提取字符串值
+fn extract_field(line: &str, key: &str) -> Option<String> {
+    let pat = format!("\"{}\":\"", key);
+    let pos = line.find(&pat)?;
+    let start = pos + pat.len();
+    let rest = &line[start..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
+// 从 YAML 行 `KEY: value` 提取（去除首尾引号）
+fn extract_yaml_value(content: &str, key: &str) -> Option<String> {
+    let pat = format!("{}:", key);
+    let line = content.lines().find(|l| l.trim_start().starts_with(&pat))?;
+    let after = line.splitn(2, ':').nth(1)?;
+    let v = after.trim().trim_matches('"').trim_matches('\'').to_string();
+    if v.is_empty() {
+        None
+    } else {
+        Some(v)
+    }
+}
+
+// 从 "inputTokens":N 之后解析连续四个整数
+fn parse_u64(s: &str) -> Option<(u64, usize)> {
+    let bytes = s.as_bytes();
+    let mut j = 0;
+    while j < bytes.len() && !bytes[j].is_ascii_digit() {
+        j += 1;
+    }
+    let start = j;
+    while j < bytes.len() && bytes[j].is_ascii_digit() {
+        j += 1;
+    }
+    if j == start {
+        return None;
+    }
+    let v: u64 = s[start..j].parse().ok()?;
+    Some((v, j))
+}
+
+fn parse_usage(s: &str) -> Option<(u64, u64, u64, u64)> {
+    let s = s.strip_prefix("\"inputTokens\":")?;
+    let (input, p1) = parse_u64(s)?;
+    let s = &s[p1..];
+    let s = s.strip_prefix(",\"outputTokens\":")?;
+    let (output, p2) = parse_u64(s)?;
+    let s = &s[p2..];
+    let s = s.strip_prefix(",\"cacheReadTokens\":")?;
+    let (cache, p3) = parse_u64(s)?;
+    let s = &s[p3..];
+    let s = s.strip_prefix(",\"reasoningTokens\":")?;
+    let (reasoning, _p4) = parse_u64(s)?;
+    Some((input, output, cache, reasoning))
+}
+
+// 估算费用（美元），参考 DeepSeek 公开定价，仅供参考
+fn estimate_cost(model: &str, input: u64, cache_read: u64, output: u64) -> f64 {
+    let (input_rate, cache_rate, output_rate) = if model.contains("reasoner") || model.contains("r1") {
+        (0.55, 0.14, 2.19)
+    } else {
+        (0.27, 0.07, 1.10)
+    };
+    let m = 1_000_000.0;
+    (input as f64 / m) * input_rate
+        + (cache_read as f64 / m) * cache_rate
+        + (output as f64 / m) * output_rate
+}
+
+// 最佳努力获取 DeepSeek 账户余额（需联网 + ~/.dsh/.credentials.yaml 中的 API Key）
+fn fetch_balance() -> Option<BalanceInfo> {
+    let home = std::env::var("HOME").ok()?;
+    let cred = PathBuf::from(&home).join(".dsh").join(".credentials.yaml");
+    let content = std::fs::read_to_string(&cred).ok()?;
+    let key = extract_yaml_value(&content, "DEEPSEEK_API_KEY")?;
+    if key.is_empty() {
+        return None;
+    }
+    let out = Command::new("curl")
+        .args([
+            "-sS",
+            "-m",
+            "10",
+            "-H",
+            &format!("Authorization: Bearer {}", key),
+            "https://api.deepseek.com/user/balance",
+        ])
+        .output()
+        .ok()?;
+    let body = String::from_utf8_lossy(&out.stdout);
+    let v: serde_json::Value = serde_json::from_str(&body).ok()?;
+    let infos = v.get("balance_infos")?.as_array()?;
+    let first = infos.first()?;
+    let total = first.get("total_balance")?.as_str()?.to_string();
+    let currency = first
+        .get("currency")
+        .and_then(|c| c.as_str())
+        .unwrap_or("USD")
+        .to_string();
+    Some(BalanceInfo {
+        total_balance: total,
+        currency,
+    })
+}
+
+fn aggregate_file(path: &PathBuf) -> Result<(FileAgg, Option<String>), String> {
+    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+    let decompressed = zstd::decode_all(&bytes[..]).map_err(|e| format!("zstd 解压失败: {}", e))?;
+    let text = String::from_utf8_lossy(&decompressed);
+    let mut agg = FileAgg {
+        input: 0,
+        output: 0,
+        cache_read: 0,
+        reasoning: 0,
+        calls: 0,
+        by_model: BTreeMap::new(),
+    };
+    let mut cwd = None;
+    for (idx, line) in text.lines().enumerate() {
+        if idx == 0 {
+            cwd = extract_field(line, "cwd");
+        }
+        let model = extract_field(line, "model").unwrap_or_default();
+        let mut pos = 0;
+        while let Some(p) = line[pos..].find("\"inputTokens\":") {
+            let abs = pos + p;
+            if let Some((i, o, c, r)) = parse_usage(&line[abs..]) {
+                agg.input += i;
+                agg.output += o;
+                agg.cache_read += c;
+                agg.reasoning += r;
+                agg.calls += 1;
+                if !model.is_empty() {
+                    let e = agg.by_model.entry(model.clone()).or_insert_with(|| ModelStat {
+                        model: model.clone(),
+                        input: 0,
+                        output: 0,
+                        cache_read: 0,
+                        reasoning: 0,
+                        calls: 0,
+                    });
+                    e.input += i;
+                    e.output += o;
+                    e.cache_read += c;
+                    e.reasoning += r;
+                    e.calls += 1;
+                }
+            }
+            pos = abs + 1;
+        }
+    }
+    Ok((agg, cwd))
+}
+
+fn scan_sessions() -> UsageStats {
+    let mut errors: Vec<String> = Vec::new();
+    let mut total = TokenBreakdown {
+        input: 0,
+        output: 0,
+        cache_read: 0,
+        reasoning: 0,
+        total: 0,
+    };
+    let mut by_model: BTreeMap<String, ModelStat> = BTreeMap::new();
+    let mut by_session: Vec<SessionStat> = Vec::new();
+    let mut session_count = 0usize;
+    let mut scanned_files = 0usize;
+
+    let home = std::env::var("HOME").unwrap_or_default();
+    let sessions_dir = PathBuf::from(&home).join(".dsh").join("sessions");
+    if !sessions_dir.is_dir() {
+        errors.push(format!("未找到会话目录: {}", sessions_dir.display()));
+        return UsageStats {
+            total,
+            by_model: vec![],
+            by_session,
+            estimated_cost_usd: 0.0,
+            balance: None,
+            session_count,
+            scanned_files,
+            errors,
+        };
+    }
+
+    if let Ok(ws_entries) = std::fs::read_dir(&sessions_dir) {
+        for ws in ws_entries.flatten() {
+            let ws_path = ws.path();
+            if !ws_path.is_dir() {
+                continue;
+            }
+            let slug = ws_path
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default();
+            if let Ok(sess_entries) = std::fs::read_dir(&ws_path) {
+                for sess in sess_entries.flatten() {
+                    let sess_path = sess.path();
+                    if !sess_path.is_dir() {
+                        continue;
+                    }
+                    let session_id = sess_path
+                        .file_name()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    let file = sess_path.join("session.jsonl.zstd");
+                    if !file.is_file() {
+                        continue;
+                    }
+                    scanned_files += 1;
+                    session_count += 1;
+                    match aggregate_file(&file) {
+                        Ok((agg, cwd)) => {
+                            total.input += agg.input;
+                            total.output += agg.output;
+                            total.cache_read += agg.cache_read;
+                            total.reasoning += agg.reasoning;
+                            total.total +=
+                                agg.input + agg.output + agg.cache_read + agg.reasoning;
+                            for ms in agg.by_model.values() {
+                                let e = by_model.entry(ms.model.clone()).or_insert_with(|| {
+                                    ModelStat {
+                                        model: ms.model.clone(),
+                                        input: 0,
+                                        output: 0,
+                                        cache_read: 0,
+                                        reasoning: 0,
+                                        calls: 0,
+                                    }
+                                });
+                                e.input += ms.input;
+                                e.output += ms.output;
+                                e.cache_read += ms.cache_read;
+                                e.reasoning += ms.reasoning;
+                                e.calls += ms.calls;
+                            }
+                            by_session.push(SessionStat {
+                                workspace: cwd.unwrap_or(slug.clone()),
+                                session_id,
+                                input: agg.input,
+                                output: agg.output,
+                                cache_read: agg.cache_read,
+                                reasoning: agg.reasoning,
+                                calls: agg.calls,
+                            });
+                        }
+                        Err(e) => errors.push(format!("{}: {}", file.display(), e)),
+                    }
+                }
+            }
+        }
+    }
+
+    let mut cost = 0.0f64;
+    for ms in by_model.values() {
+        cost += estimate_cost(&ms.model, ms.input, ms.cache_read, ms.output);
+    }
+
+    let balance = fetch_balance();
+
+    let mut by_model_vec: Vec<ModelStat> = by_model.into_values().collect();
+    by_model_vec.sort_by(|a, b| {
+        (b.input + b.output + b.cache_read + b.reasoning)
+            .cmp(&(a.input + a.output + a.cache_read + a.reasoning))
+    });
+    by_session.sort_by(|a, b| {
+        (b.input + b.output + b.cache_read + b.reasoning)
+            .cmp(&(a.input + a.output + a.cache_read + a.reasoning))
+    });
+
+    UsageStats {
+        total,
+        by_model: by_model_vec,
+        by_session,
+        estimated_cost_usd: cost,
+        balance,
+        session_count,
+        scanned_files,
+        errors,
+    }
+}
+
+#[tauri::command]
+fn get_usage_stats() -> UsageStats {
+    scan_sessions()
+}
+
+// 打开独立的用量统计窗口（单例）
+fn open_usage_window(app: &tauri::AppHandle) {
+    if let Some(w) = app.get_webview_window("usage") {
+        let _ = w.show();
+        let _ = w.set_focus();
+        return;
+    }
+    let _ = WebviewWindowBuilder::new(app, "usage", WebviewUrl::App("usage.html".into()))
+        .title("用量统计")
+        .inner_size(960.0, 700.0)
+        .min_inner_size(720.0, 520.0)
+        .build();
+}
+
+fn build_app_menu(app: &tauri::App) -> Result<tauri::menu::Menu<tauri::Wry>, Box<dyn std::error::Error>> {
+    let usage_item = MenuItem::with_id(app, "usage_stats", "用量统计", true, None::<&str>)?;
+    let menu = Menu::default(app.handle())?;
+    menu.append_items(&[&usage_item])?;
+    Ok(menu)
+}
+
 fn launch_main(app: &tauri::AppHandle) {
-    let dsh_path = find_dsh_candidates()
-        .into_iter()
-        .find(|c| run_dsh_version(c).is_some());
+    let dsh_path = select_dsh();
 
     let mut port = PORT;
     if let Some(path) = &dsh_path {
@@ -630,9 +1017,20 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             get_detect_result,
             install_dsh,
-            cancel_precheck
+            cancel_precheck,
+            get_usage_stats
         ])
         .setup(|app| {
+            // 菜单栏加入「用量统计」入口
+            if let Ok(menu) = build_app_menu(app) {
+                let _ = app.set_menu(menu);
+            }
+            app.on_menu_event(|app, event| {
+                if event.id().as_ref() == "usage_stats" {
+                    open_usage_window(app);
+                }
+            });
+
             let result = detect_environment();
             if result.ok {
                 launch_main(app.handle());
