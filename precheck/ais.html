@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <title>AIS Switch</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Helvetica Neue", sans-serif;
+      background: #f6f7f9;
+      color: #1f2329;
+      padding: 22px 24px 28px;
+      -webkit-user-select: none;
+      user-select: none;
+    }
+    h1 { font-size: 18px; font-weight: 600; margin-bottom: 4px; }
+    .sub { font-size: 12px; color: #6b7280; margin-bottom: 14px; line-height: 1.5; }
+    .note {
+      background: #fffbeb; border: 1px solid #fde68a; color: #92400e;
+      border-radius: 8px; padding: 10px 12px; font-size: 12px; line-height: 1.5; margin-bottom: 14px;
+    }
+    .actions { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
+    button {
+      font-size: 13px; border-radius: 6px; padding: 8px 14px;
+      border: 1px solid transparent; cursor: pointer; font-weight: 500;
+    }
+    button:disabled { opacity: .55; cursor: not-allowed; }
+    #check { background: #2563eb; color: #fff; }
+    #setup { background: #fff; color: #1f2329; border-color: #d1d5db; }
+    #refresh { background: #fff; color: #1f2329; border-color: #d1d5db; }
+    #remove { background: #fff; color: #b91c1c; border-color: #fecaca; }
+    #open-app {
+      background: #fff; color: #1f2329; border-color: #d1d5db; display: none;
+    }
+    #open-app.need {
+      display: inline-block;
+      background: #111827; color: #fff; border-color: #111827;
+    }
+    #restart {
+      background: #fff; color: #1f2329; border-color: #d1d5db; display: none;
+    }
+    .gate-hint {
+      font-size: 12px; border-radius: 6px; padding: 8px 10px; margin-bottom: 12px; line-height: 1.5;
+    }
+    .gate-hint.ok { background: #ecfdf5; border: 1px solid #a7f3d0; color: #047857; }
+    .gate-hint.warn { background: #fef2f2; border: 1px solid #fecaca; color: #b91c1c; }
+    label { font-size: 12px; color: #4b5563; display: flex; align-items: center; gap: 6px; margin-bottom: 12px; }
+    .status { font-size: 13px; margin-bottom: 10px; min-height: 18px; line-height: 1.45; }
+    .status.ok { color: #059669; }
+    .status.fail { color: #dc2626; }
+    .section {
+      background: #fff; border: 1px solid #e5e7eb; border-radius: 10px;
+      padding: 12px 14px; margin-bottom: 12px;
+    }
+    .section h2 { font-size: 13px; font-weight: 600; margin-bottom: 8px; }
+    .step { font-size: 12px; line-height: 1.55; margin-bottom: 4px; }
+    .step.ok::before { content: "✓ "; color: #059669; }
+    .step.fail::before { content: "✗ "; color: #dc2626; }
+    .models { font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 11px; color: #374151; }
+    .models div { padding: 2px 0; }
+    .local { font-size: 12px; color: #4b5563; line-height: 1.6; }
+    .muted { color: #9ca3af; }
+  </style>
+</head>
+<body>
+  <h1>AIS Switch</h1>
+  <div class="sub">把公司 Codex 本地代理接到 dsh。保持 AIS Switch 开着，打开 Codex 路由并加入 LLM Gateway。</div>
+  <div class="note">非官方支持（蹭 Codex 通道）。关 AIS Switch 后选 Gateway 模型会失败；官方 DeepSeek 不受影响。不用了请点「移除」。</div>
+
+  <div class="actions">
+    <button id="check">体检</button>
+    <button id="open-app" type="button">打开 AIS Switch</button>
+    <button id="setup" disabled>接入</button>
+    <button id="refresh">刷新模型</button>
+    <button id="restart" type="button">重启 dsh 使生效</button>
+    <button id="remove">移除</button>
+  </div>
+  <div id="gate-hint" class="gate-hint warn">尚未体检，请先点「体检」。</div>
+  <label><input type="checkbox" id="set-default" /> 接入时同时设为默认模型</label>
+  <div class="status muted" id="status">正在体检…</div>
+
+  <div class="section">
+    <h2>探测</h2>
+    <div id="steps" class="muted">尚未运行</div>
+  </div>
+  <div class="section">
+    <h2>Gateway 模型</h2>
+    <div id="models" class="models muted">—</div>
+  </div>
+  <div class="section">
+    <h2>本地 dsh 配置</h2>
+    <div id="local" class="local muted">—</div>
+  </div>
+
+  <script>
+    (function () {
+      const { invoke } = window.__TAURI__.core;
+      const statusEl = document.getElementById('status');
+      const stepsEl = document.getElementById('steps');
+      const modelsEl = document.getElementById('models');
+      const localEl = document.getElementById('local');
+      const openAppBtn = document.getElementById('open-app');
+      const restartBtn = document.getElementById('restart');
+      const setupBtn = document.getElementById('setup');
+      const gateHint = document.getElementById('gate-hint');
+      const btns = ['check', 'setup', 'refresh', 'remove', 'open-app', 'restart'].map((id) => document.getElementById(id));
+      let checking = false;
+      let checked = false;
+      let lastProxyDown = false;
+      let lastHasModels = false;
+
+      function busy(on) {
+        // setup 的门禁由 updateGate 控制，busy 不覆盖它的禁用状态
+        btns.forEach((b) => { if (b !== setupBtn) b.disabled = on; });
+        if (on) setupBtn.disabled = true;
+        else updateGate();
+      }
+      function setStatus(ok, text) {
+        statusEl.className = 'status ' + (ok ? 'ok' : 'fail');
+        statusEl.textContent = text;
+      }
+      function setOpenAppNeed(need) {
+        openAppBtn.classList.toggle('need', !!need);
+        if (!need) openAppBtn.style.display = '';
+      }
+      function setRestartVisible(v) {
+        restartBtn.style.display = v ? '' : 'none';
+      }
+      function updateGate() {
+        if (!checked) {
+          setupBtn.disabled = true;
+          gateHint.className = 'gate-hint warn';
+          gateHint.textContent = '尚未体检，请先点「体检」。';
+          return;
+        }
+        if (lastProxyDown) {
+          setupBtn.disabled = true;
+          gateHint.className = 'gate-hint warn';
+          gateHint.textContent = '体检未通过：连不上 AIS Switch。请先打开 AIS Switch 并开启 Codex 路由，再重新体检。';
+        } else if (!lastHasModels) {
+          setupBtn.disabled = true;
+          gateHint.className = 'gate-hint warn';
+          gateHint.textContent = '体检未通过：没有 llm-gateway-- 模型。请把 LLM Gateway 加入路由池并刷新，再重新体检。';
+        } else {
+          setupBtn.disabled = false;
+          gateHint.className = 'gate-hint ok';
+          gateHint.textContent = '体检通过，可以接入。';
+        }
+      }
+      function renderSteps(steps) {
+        if (!steps || !steps.length) {
+          stepsEl.className = 'muted';
+          stepsEl.textContent = '尚未运行';
+          return;
+        }
+        stepsEl.className = '';
+        stepsEl.innerHTML = steps.map((s) =>
+          '<div class="step ' + (s.ok ? 'ok' : 'fail') + '">' +
+          escapeHtml(s.name) + ' — ' + escapeHtml(s.detail) + '</div>'
+        ).join('');
+      }
+      function renderModels(ids) {
+        if (!ids || !ids.length) {
+          modelsEl.className = 'models muted';
+          modelsEl.textContent = '—';
+          return;
+        }
+        modelsEl.className = 'models';
+        modelsEl.innerHTML = ids.map((id) => '<div>' + escapeHtml(id) + '</div>').join('');
+      }
+      function renderLocal(hasP, hasK) {
+        localEl.className = 'local';
+        localEl.innerHTML =
+          'ais-codex：' + (hasP ? '已配置' : '未配置') + '<br>' +
+          'AIS_CODEX_API_KEY：' + (hasK ? '已配置' : '未配置');
+      }
+      function escapeHtml(s) {
+        return String(s == null ? '' : s)
+          .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      }
+
+      function runCheck() {
+        if (checking) return;
+        checking = true;
+        busy(true);
+        setStatus(true, '体检中…');
+        invoke('ais_switch_check').then((r) => {
+          renderSteps(r.steps);
+          renderModels(r.models);
+          renderLocal(r.has_provider, r.has_key);
+          setOpenAppNeed(!!r.proxy_down);
+          checked = true;
+          lastProxyDown = !!r.proxy_down;
+          lastHasModels = !!(r.models && r.models.length);
+          setRestartVisible(!!r.has_provider);
+          if (r.ok) {
+            setStatus(true, '体检通过。可点「接入」写入本地配置。');
+          } else if (r.proxy_down) {
+            setStatus(false, '连不上本地代理。请先打开 AIS Switch，并打开 Codex 路由。');
+          } else {
+            setStatus(false, '体检未通过，看上方探测明细。');
+          }
+        }).catch((e) => {
+          checked = true;
+          lastProxyDown = true;
+          setOpenAppNeed(true);
+          setStatus(false, String(e));
+        }).finally(() => {
+          checking = false;
+          busy(false);
+        });
+      }
+
+      window.__aisRecheck = runCheck;
+
+      document.getElementById('check').onclick = runCheck;
+
+      openAppBtn.onclick = function () {
+        busy(true);
+        invoke('ais_switch_open_app').then((r) => {
+          setStatus(r.ok, r.message);
+          if (r.ok) setTimeout(runCheck, 1600);
+        }).catch((e) => setStatus(false, String(e))).finally(() => busy(false));
+      };
+
+      document.getElementById('setup').onclick = function () {
+        busy(true);
+        setStatus(true, '写入配置…');
+        const setDefault = document.getElementById('set-default').checked;
+        invoke('ais_switch_setup', { setDefault: setDefault }).then((r) => {
+          renderModels(r.models);
+          setStatus(r.ok, r.message);
+          if (r.ok) { renderLocal(true, true); setRestartVisible(true); }
+        }).catch((e) => setStatus(false, String(e))).finally(() => busy(false));
+      };
+
+      document.getElementById('refresh').onclick = function () {
+        busy(true);
+        setStatus(true, '刷新模型…');
+        invoke('ais_switch_refresh').then((r) => {
+          renderModels(r.models);
+          setStatus(r.ok, r.message);
+          if (r.ok) setRestartVisible(true);
+        }).catch((e) => setStatus(false, String(e))).finally(() => busy(false));
+      };
+
+      restartBtn.onclick = function () {
+        if (!confirm('重启 dsh 会中断当前正在进行的会话，确定继续？')) return;
+        busy(true);
+        setStatus(true, '正在重启 dsh…');
+        invoke('ais_switch_restart_dsh').then((r) => {
+          setStatus(r.ok, r.message);
+          if (r.ok) setTimeout(runCheck, 800);
+        }).catch((e) => setStatus(false, String(e))).finally(() => busy(false));
+      };
+
+      document.getElementById('remove').onclick = function () {
+        if (!confirm('移除 ais-codex 配置？（不删除 DEEPSEEK_API_KEY）')) return;
+        busy(true);
+        invoke('ais_switch_remove').then((r) => {
+          if (r.ok) {
+            renderModels([]);
+            renderLocal(false, false);
+            setRestartVisible(false);
+            setTimeout(runCheck, 400); // 重新体检，刷新门禁与重启按钮状态
+          }
+          setStatus(r.ok, r.message);
+        }).catch((e) => setStatus(false, String(e))).finally(() => busy(false));
+      };
+
+      runCheck();
+    })();
+  </script>
+</body>
+</html>

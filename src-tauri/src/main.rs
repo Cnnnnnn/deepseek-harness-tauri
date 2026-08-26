@@ -12,8 +12,10 @@ use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use tauri::menu::{Menu, MenuItem};
+use tauri::menu::{Menu, MenuItem, Submenu};
 use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
+
+mod ais_codex;
 
 const HOST: &str = "127.0.0.1";
 const PORT: u16 = 3080;
@@ -43,6 +45,8 @@ struct DetectResult {
 struct DshProcess(Mutex<Option<Child>>);
 struct InstallProcess(Mutex<Option<i32>>); // 安装进程组 pid
 struct QuitFlag(AtomicBool); // 是否正在退出，用于抑制崩溃自动重启
+struct DshPort(Mutex<Option<u16>>); // 当前 dsh web 端口（用于手动重启时等待就绪）
+struct DshVersion(Mutex<Option<String>>); // 当前 dsh 版本（重启后重注入角标用）
 
 // ---------- 日志 ----------
 
@@ -920,6 +924,44 @@ fn get_usage_stats() -> UsageStats {
     scan_sessions()
 }
 
+// AIS 体检最坏要串行跑 health/status/models/chat ping（最长 ~48s），
+// Tauri 2 同步命令在主线程内联执行会卡死整个 UI；统一改 async + spawn_blocking
+// 把阻塞的 curl / 文件 I/O 挪到线程池，保证窗口与菜单不冻结。
+#[tauri::command]
+async fn ais_switch_check() -> Result<ais_codex::AisCheckResult, String> {
+    tauri::async_runtime::spawn_blocking(ais_codex::check)
+        .await
+        .map_err(|e| format!("体检线程异常：{e}"))
+}
+
+#[tauri::command]
+async fn ais_switch_setup(set_default: bool) -> Result<ais_codex::AisActionResult, String> {
+    tauri::async_runtime::spawn_blocking(move || ais_codex::setup(set_default))
+        .await
+        .map_err(|e| format!("接入线程异常：{e}"))
+}
+
+#[tauri::command]
+async fn ais_switch_refresh() -> Result<ais_codex::AisActionResult, String> {
+    tauri::async_runtime::spawn_blocking(ais_codex::refresh)
+        .await
+        .map_err(|e| format!("刷新线程异常：{e}"))
+}
+
+#[tauri::command]
+async fn ais_switch_remove() -> Result<ais_codex::AisActionResult, String> {
+    tauri::async_runtime::spawn_blocking(ais_codex::remove)
+        .await
+        .map_err(|e| format!("移除线程异常：{e}"))
+}
+
+#[tauri::command]
+async fn ais_switch_open_app() -> Result<ais_codex::AisActionResult, String> {
+    tauri::async_runtime::spawn_blocking(ais_codex::open_app)
+        .await
+        .map_err(|e| format!("打开 AIS Switch 线程异常：{e}"))
+}
+
 // 打开独立的用量统计窗口（单例）
 fn open_usage_window(app: &tauri::AppHandle) {
     if let Some(w) = app.get_webview_window("usage") {
@@ -934,11 +976,130 @@ fn open_usage_window(app: &tauri::AppHandle) {
         .build();
 }
 
+// 一键重启 dsh 使配置生效：杀掉子进程，等 monitor_dsh 在同端口自动拉起，并刷新主窗口
+#[tauri::command]
+async fn ais_switch_restart_dsh(app: tauri::AppHandle) -> Result<ais_codex::AisActionResult, String> {
+    tauri::async_runtime::spawn_blocking(move || restart_dsh(&app))
+        .await
+        .map_err(|e| format!("重启线程异常：{e}"))
+}
+
+fn restart_dsh(app: &tauri::AppHandle) -> ais_codex::AisActionResult {
+    let port = match *app.state::<DshPort>().0.lock().unwrap() {
+        Some(p) => p,
+        None => {
+            return ais_codex::AisActionResult {
+                ok: false,
+                message: "dsh 尚未启动，无需重启。".into(),
+                models: vec![],
+            }
+        }
+    };
+    let had_child = {
+        let state = app.state::<DshProcess>();
+        let mut guard = state.0.lock().unwrap();
+        match guard.as_mut() {
+            Some(c) => {
+                let _ = c.kill();
+                true
+            }
+            None => false,
+        }
+    };
+    if !had_child {
+        return ais_codex::AisActionResult {
+            ok: false,
+            message: "未找到运行中的 dsh 进程（可能在重启中），稍后再试。".into(),
+            models: vec![],
+        };
+    }
+    if !wait_for_port(HOST, port, Duration::from_secs(25)) {
+        return ais_codex::AisActionResult {
+            ok: false,
+            message: "dsh 重启超时，请到「环境检查 / 安装日志」查看。".into(),
+            models: vec![],
+        };
+    }
+    // 刷新主窗口，让新的 provider / 模型列表立即生效
+    let app2 = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        if let Some(w) = app2.get_webview_window("main") {
+            let _ = w.eval("window.location.reload()");
+        }
+    });
+    // reload 会清掉版本角标，等页面加载后重注入
+    if let Some(ver) = app.state::<DshVersion>().0.lock().unwrap().clone() {
+        inject_version_badge(app, &ver);
+    }
+    ais_codex::AisActionResult {
+        ok: true,
+        message: "dsh 已重启，新配置已生效。".into(),
+        models: vec![],
+    }
+}
+
+fn open_ais_window(app: &tauri::AppHandle) {
+    if let Some(w) = app.get_webview_window("ais") {
+        let _ = w.show();
+        let _ = w.set_focus();
+        // 再次打开时自动复检
+        let _ = w.eval("window.__aisRecheck && window.__aisRecheck()");
+        return;
+    }
+    let _ = WebviewWindowBuilder::new(app, "ais", WebviewUrl::App("ais.html".into()))
+        .title("AIS Switch")
+        .inner_size(560.0, 640.0)
+        .min_inner_size(480.0, 480.0)
+        .build();
+}
+
 fn build_app_menu(app: &tauri::App) -> Result<tauri::menu::Menu<tauri::Wry>, Box<dyn std::error::Error>> {
+    // macOS 顶栏菜单；不要往 Menu 根上直接塞 MenuItem（不容易看见）
     let usage_item = MenuItem::with_id(app, "usage_stats", "用量统计", true, None::<&str>)?;
+    let ais_item = MenuItem::with_id(app, "ais_switch", "AIS Switch…", true, None::<&str>)?;
+    let tools = Submenu::with_id_and_items(
+        app,
+        "tools",
+        "工具",
+        true,
+        &[&usage_item, &ais_item],
+    )?;
     let menu = Menu::default(app.handle())?;
-    menu.append_items(&[&usage_item])?;
+    menu.append(&tools)?;
     Ok(menu)
+}
+
+// 在 dsh web 页面注入常驻版本角标（自修复：应对 SPA 重渲染；reload 后需重新注入）
+fn inject_version_badge(app: &tauri::AppHandle, ver: &str) {
+    let ver = ver.to_string();
+    let app2 = app.clone();
+    std::thread::spawn(move || {
+        // 给首次窗口一个缓冲；注入脚本内部会等页面 ready 后再落 DOM，
+        // 并用递归 setTimeout 持续维持，reload 后重新调用也能可靠补上
+        std::thread::sleep(Duration::from_millis(1200));
+        let app_for_closure = app2.clone();
+        let _ = app2.run_on_main_thread(move || {
+            if let Some(w) = app_for_closure.get_webview_window("main") {
+                let badge_js = [
+                    "(function(){function step(){",
+                    "var b=document.getElementById('dsh-version-badge');",
+                    "if(!b){",
+                    "if(!document.body||document.readyState==='loading'){setTimeout(step,400);return;}",
+                    "b=document.createElement('div');b.id='dsh-version-badge';",
+                    "b.textContent='dsh ", ver.as_str(), "';",
+                    "b.style.cssText='position:fixed;right:10px;bottom:10px;z-index:2147483647;",
+                    "background:rgba(15,23,42,.82);color:#e2e8f0;",
+                    "font:12px -apple-system,BlinkMacSystemFont,sans-serif;padding:4px 9px;",
+                    "border-radius:6px;pointer-events:none;box-shadow:0 1px 4px rgba(0,0,0,.35)';",
+                    "document.body.appendChild(b);}",
+                    "setTimeout(step,1000);}",
+                    "step();})();",
+                ]
+                .concat();
+                let _ = w.eval(badge_js);
+            }
+        });
+    });
 }
 
 fn launch_main(app: &tauri::AppHandle) {
@@ -947,6 +1108,7 @@ fn launch_main(app: &tauri::AppHandle) {
     let mut port = PORT;
     if let Some(path) = &dsh_path {
         port = find_free_port(PORT);
+        *app.state::<DshPort>().0.lock().unwrap() = Some(port);
         if start_dsh_with_retry(app, path, port, 3) {
             let app_clone = app.clone();
             let path_clone = path.clone();
@@ -973,29 +1135,9 @@ fn launch_main(app: &tauri::AppHandle) {
     .build();
 
     // 在 dsh web 页面注入常驻角标，显示当前 dsh 版本（自修复：应对 SPA 重渲染）
+    *app.state::<DshVersion>().0.lock().unwrap() = Some(dsh_version.clone());
     if let Ok(_win) = win {
-        let ver = dsh_version.clone();
-        let app2 = app.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(1500));
-            let app_for_closure = app2.clone();
-            let _ = app2.run_on_main_thread(move || {
-                if let Some(w) = app_for_closure.get_webview_window("main") {
-                    let badge_js = [
-                        "(function(){function e(){var b=document.getElementById('dsh-version-badge');",
-                        "if(!b){b=document.createElement('div');b.id='dsh-version-badge';",
-                        "b.textContent='dsh ", ver.as_str(), "';",
-                        "b.style.cssText='position:fixed;right:10px;bottom:10px;z-index:2147483647;",
-                        "background:rgba(15,23,42,.82);color:#e2e8f0;",
-                        "font:12px -apple-system,BlinkMacSystemFont,sans-serif;padding:4px 9px;",
-                        "border-radius:6px;pointer-events:none;box-shadow:0 1px 4px rgba(0,0,0,.35)';}",
-                        "}(document.body||document.documentElement).appendChild(b);}e();setInterval(e,1000);})();",
-                    ]
-                    .concat();
-                    let _ = w.eval(badge_js);
-                }
-            });
-        });
+        inject_version_badge(app, &dsh_version);
     }
 }
 
@@ -1014,11 +1156,19 @@ fn main() {
         .manage(DshProcess(Mutex::new(None)))
         .manage(InstallProcess(Mutex::new(None)))
         .manage(QuitFlag(AtomicBool::new(false)))
+        .manage(DshPort(Mutex::new(None)))
+        .manage(DshVersion(Mutex::new(None)))
         .invoke_handler(tauri::generate_handler![
             get_detect_result,
             install_dsh,
             cancel_precheck,
-            get_usage_stats
+            get_usage_stats,
+            ais_switch_check,
+            ais_switch_setup,
+            ais_switch_refresh,
+            ais_switch_remove,
+            ais_switch_open_app,
+            ais_switch_restart_dsh
         ])
         .setup(|app| {
             // 菜单栏加入「用量统计」入口
@@ -1026,8 +1176,10 @@ fn main() {
                 let _ = app.set_menu(menu);
             }
             app.on_menu_event(|app, event| {
-                if event.id().as_ref() == "usage_stats" {
-                    open_usage_window(app);
+                match event.id().as_ref() {
+                    "usage_stats" => open_usage_window(app),
+                    "ais_switch" => open_ais_window(app),
+                    _ => {}
                 }
             });
 
