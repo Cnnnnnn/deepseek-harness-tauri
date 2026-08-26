@@ -1,0 +1,21 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  ais-codex-checks:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Rust tests（含 mock AIS 集成测试 + 共享 fixture 契约）
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+      - name: Python self-check（含共享 fixture 契约）
+        run: python3 scripts/setup-ais-codex.py --self-check
+      - name: Build
+        run: cargo build --manifest-path src-tauri/Cargo.toml

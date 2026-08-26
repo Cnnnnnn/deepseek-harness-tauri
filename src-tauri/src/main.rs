@@ -69,6 +69,11 @@ fn emit_log(app: &tauri::AppHandle, line: &str) {
     let _ = app.emit("install_log", format!("{line}\n"));
 }
 
+// AIS Switch 操作的排障日志（写到 install.log，前缀 [ais]）
+fn ais_log(app: &tauri::AppHandle, line: &str) {
+    log_to_file(app, &format!("[ais] {line}"));
+}
+
 // ---------- 工具函数 ----------
 
 fn port_in_use(host: &str, port: u16) -> bool {
@@ -928,38 +933,86 @@ fn get_usage_stats() -> UsageStats {
 // Tauri 2 同步命令在主线程内联执行会卡死整个 UI；统一改 async + spawn_blocking
 // 把阻塞的 curl / 文件 I/O 挪到线程池，保证窗口与菜单不冻结。
 #[tauri::command]
-async fn ais_switch_check() -> Result<ais_codex::AisCheckResult, String> {
-    tauri::async_runtime::spawn_blocking(ais_codex::check)
+async fn ais_switch_check(app: tauri::AppHandle) -> Result<ais_codex::AisCheckResult, String> {
+    let r = tauri::async_runtime::spawn_blocking(ais_codex::check)
         .await
-        .map_err(|e| format!("体检线程异常：{e}"))
+        .map_err(|e| format!("体检线程异常：{e}"))?;
+    ais_log(
+        &app,
+        &format!(
+            "体检 ok={} 模型数={} 代理down={} provider={} key={} 配置目录={}",
+            r.ok,
+            r.models.len(),
+            r.proxy_down,
+            r.has_provider,
+            r.has_key,
+            ais_codex::config_home_display()
+        ),
+    );
+    Ok(r)
 }
 
 #[tauri::command]
-async fn ais_switch_setup(set_default: bool) -> Result<ais_codex::AisActionResult, String> {
-    tauri::async_runtime::spawn_blocking(move || ais_codex::setup(set_default))
+async fn ais_switch_setup(app: tauri::AppHandle, set_default: bool) -> Result<ais_codex::AisActionResult, String> {
+    let r = tauri::async_runtime::spawn_blocking(move || ais_codex::setup(set_default))
         .await
-        .map_err(|e| format!("接入线程异常：{e}"))
+        .map_err(|e| format!("接入线程异常：{e}"))?;
+    ais_log(
+        &app,
+        &format!(
+            "接入 ok={} set_default={} 模型数={} 配置目录={} msg={}",
+            r.ok,
+            set_default,
+            r.models.len(),
+            ais_codex::config_home_display(),
+            r.message
+        ),
+    );
+    Ok(r)
 }
 
 #[tauri::command]
-async fn ais_switch_refresh() -> Result<ais_codex::AisActionResult, String> {
-    tauri::async_runtime::spawn_blocking(ais_codex::refresh)
+async fn ais_switch_refresh(app: tauri::AppHandle) -> Result<ais_codex::AisActionResult, String> {
+    let r = tauri::async_runtime::spawn_blocking(ais_codex::refresh)
         .await
-        .map_err(|e| format!("刷新线程异常：{e}"))
+        .map_err(|e| format!("刷新线程异常：{e}"))?;
+    ais_log(
+        &app,
+        &format!(
+            "刷新 ok={} 模型数={} 配置目录={} msg={}",
+            r.ok,
+            r.models.len(),
+            ais_codex::config_home_display(),
+            r.message
+        ),
+    );
+    Ok(r)
 }
 
 #[tauri::command]
-async fn ais_switch_remove() -> Result<ais_codex::AisActionResult, String> {
-    tauri::async_runtime::spawn_blocking(ais_codex::remove)
+async fn ais_switch_remove(app: tauri::AppHandle) -> Result<ais_codex::AisActionResult, String> {
+    let r = tauri::async_runtime::spawn_blocking(ais_codex::remove)
         .await
-        .map_err(|e| format!("移除线程异常：{e}"))
+        .map_err(|e| format!("移除线程异常：{e}"))?;
+    ais_log(
+        &app,
+        &format!(
+            "移除 ok={} 配置目录={} msg={}",
+            r.ok,
+            ais_codex::config_home_display(),
+            r.message
+        ),
+    );
+    Ok(r)
 }
 
 #[tauri::command]
-async fn ais_switch_open_app() -> Result<ais_codex::AisActionResult, String> {
-    tauri::async_runtime::spawn_blocking(ais_codex::open_app)
+async fn ais_switch_open_app(app: tauri::AppHandle) -> Result<ais_codex::AisActionResult, String> {
+    let r = tauri::async_runtime::spawn_blocking(ais_codex::open_app)
         .await
-        .map_err(|e| format!("打开 AIS Switch 线程异常：{e}"))
+        .map_err(|e| format!("打开 AIS Switch 线程异常：{e}"))?;
+    ais_log(&app, &format!("打开 AIS Switch ok={} msg={}", r.ok, r.message));
+    Ok(r)
 }
 
 // 打开独立的用量统计窗口（单例）
@@ -985,6 +1038,20 @@ async fn ais_switch_restart_dsh(app: tauri::AppHandle) -> Result<ais_codex::AisA
 }
 
 fn restart_dsh(app: &tauri::AppHandle) -> ais_codex::AisActionResult {
+    let result = restart_dsh_inner(app);
+    ais_log(
+        app,
+        &format!(
+            "重启 dsh ok={} 配置目录={} msg={}",
+            result.ok,
+            ais_codex::config_home_display(),
+            result.message
+        ),
+    );
+    result
+}
+
+fn restart_dsh_inner(app: &tauri::AppHandle) -> ais_codex::AisActionResult {
     let port = match *app.state::<DshPort>().0.lock().unwrap() {
         Some(p) => p,
         None => {

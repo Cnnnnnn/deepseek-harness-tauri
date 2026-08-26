@@ -66,10 +66,18 @@ python3 setup-ais-codex.py --remove
 | dsh 里看不到 ais-codex | 先 `--check` 通过，再跑无参数 setup，然后重启 dsh |
 | 不用了 | `--remove`（不动你的 `DEEPSEEK_API_KEY`） |
 
-**命令行脚本**支持用环境变量覆盖代理基址（一般不用改）：
+## 细节 / 说明
 
-```bash
-export AIS_SWITCH_PROXY=http://127.0.0.1:15721
-```
+- **代理基址**：应用与命令行脚本都读 `AIS_SWITCH_PROXY` 环境变量（默认 `http://127.0.0.1:15721`）。要改就在启动 App / 跑脚本前 export。
+- **配置目录**：都读 `DSH_HOME`（默认 `~/.dsh`）。
+- **跨进程锁**：App 与脚本共用 `$DSH_HOME/.ais-codex.lock`，避免同时写 `settings.yaml` / `.credentials.yaml` 互相踩。
+- **默认模型还原**：接入勾选/加 `--set-default` 时，先把接入前的 `agent-default-model` 备份到 `$DSH_HOME/.ais-default-model.bak`；移除时原样还原。重复接入不会覆盖第一份备份。
+- **操作日志**：App 内 AIS 操作写进安装日志（`install.log`，前缀 `[ais]`），含配置目录、模型数、结果，排障看这里。
 
-应用内「工具 → AIS Switch…」固定连 `127.0.0.1:15721`，暂不支持改地址；需要改走命令行脚本。
+## 维护（给开发者）
+
+Rust（`src-tauri/src/ais_codex.rs`）与脚本（`setup-ais-codex.py`）是同一套 YAML 逻辑的两份实现，用**共享 fixture** 防漂移：
+
+- 契约数据在 `scripts/tests/fixtures/`（baseURL 用 `__BASE_URL__` 占位）。
+- `cargo test`（含 `fixture_contract_matches` 与 mock AIS 全链路集成测试）+ `python3 setup-ais-codex.py --self-check`（含同一契约）都必须通过；CI（`.github/workflows/ci.yml`）会在每次 push/PR 跑这两项。
+- 改模型列表后重新生成期望输出：`python3 scripts/tests/gen_fixtures.py`。

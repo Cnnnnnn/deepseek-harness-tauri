@@ -1,0 +1,13 @@
+ui-theme:
+  preference: system
+
+llm-pi-ai:
+  providers:
+    other:
+      api: openai-completions
+      baseURL: http://example.invalid/v1
+
+agent-default-model:
+  provider: deepseek-official
+  model: deepseek-v4-flash
+  reasoningEffort: high

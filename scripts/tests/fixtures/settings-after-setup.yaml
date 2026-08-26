@@ -1,0 +1,25 @@
+ui-theme:
+  preference: system
+
+llm-pi-ai:
+  providers:
+    ais-codex:
+      displayName: AIS Switch (Codex)
+      api: openai-completions
+      baseURL: __BASE_URL__
+      apiKeyEnv: AIS_CODEX_API_KEY
+      defaultContextWindow: 1000000
+      defaultMaxTokens: 131072
+      models:
+        - id: llm-gateway--deepseek-v4-flash
+          name: deepseek-v4-flash
+        - id: llm-gateway--glm-5.2
+          name: glm-5.2
+    other:
+      api: openai-completions
+      baseURL: http://example.invalid/v1
+
+agent-default-model:
+  provider: ais-codex
+  model: llm-gateway--deepseek-v4-flash
+  reasoningEffort: high

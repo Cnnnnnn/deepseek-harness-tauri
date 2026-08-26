@@ -22,6 +22,7 @@ import argparse
 import json
 import os
 import re
+import fcntl
 import stat
 import sys
 import tempfile
@@ -503,7 +504,10 @@ def _agent_default_provider(settings: str) -> str | None:
 
 
 def save_default_model_backup_at(path: Path, settings: str) -> None:
-    """把当前 agent-default-model 整段备份到 path；原本没有则存空文件。"""
+    """把当前 agent-default-model 整段备份到 path；原本没有则存空文件。
+    重复接入时保留第一份（原始）快照，避免二次接入把备份覆盖成 ais-codex。"""
+    if path.exists():
+        return
     block = ""
     for key, b in split_top_level(settings):
         if key == "agent-default-model":
@@ -574,6 +578,24 @@ def write_file(path: Path, content: str, mode: int | None = None) -> None:
         os.chmod(path, mode)
 
 
+class _ConfigLock:
+    """跨进程互斥锁（与 App 共用 ~/.dsh/.ais-codex.lock），
+    防止命令行脚本与 App 同时读写 settings.yaml / .credentials.yaml。"""
+
+    def __enter__(self):
+        DSH_HOME.mkdir(parents=True, exist_ok=True)
+        self._f = open(DSH_HOME / ".ais-codex.lock", "w")
+        fcntl.flock(self._f, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc):
+        try:
+            fcntl.flock(self._f, fcntl.LOCK_UN)
+        finally:
+            self._f.close()
+        return False
+
+
 def pick_default_model(models: list[dict]) -> str:
     for m in models:
         if m["id"].endswith("deepseek-v4-flash"):
@@ -622,7 +644,9 @@ def run_self_check() -> None:
     restored = restore_default_model_at(tmp_default, overridden)
     assert "deepseek-official" in restored and "deepseek-v4-flash" in restored
     assert PROVIDER_ID not in restored and "ui-theme:" in restored
-    # 原本没有默认模型：还原为删掉整段
+    # 原本没有默认模型：还原为删掉整段（先删旧备份，模拟从未接入过）
+    if tmp_default.exists():
+        tmp_default.unlink()
     save_default_model_backup_at(tmp_default, "ui-theme:\n  preference: system\n")
     overridden2 = upsert_default_model("ui-theme:\n  preference: system\n", models[0]["id"])
     assert "agent-default-model" in overridden2
@@ -632,30 +656,48 @@ def run_self_check() -> None:
     other_default = "agent-default-model:\n  provider: something-else\n  model: x\n"
     assert restore_default_model_at(tmp_default, other_default) == (other_default if other_default.endswith("\n") else other_default + "\n")
     tmp_default.unlink()
+
+    # 共享 fixture 契约检查：与 Rust 侧（cargo test fixture_contract_matches）共用
+    # scripts/tests/fixtures/，任何一边改动 YAML 输出都会让另一边失败。
+    fixtures = Path(__file__).resolve().parent / "tests" / "fixtures"
+    read_fixture = lambda name: (fixtures / name).read_text()
+    before = read_fixture("settings-before.yaml")
+    after_setup = upsert_ais_codex_provider(before, models)
+    after_setup = upsert_default_model(after_setup, pick_default_model(models))
+    expected_setup = read_fixture("settings-after-setup.yaml").replace("__BASE_URL__", BASE_URL)
+    assert after_setup == expected_setup, "settings-after-setup 与共享 fixture 不一致（Rust↔Python 漂移？）"
+    after_remove = restore_default_model(remove_ais_codex_provider(after_setup))
+    assert after_remove == read_fixture("settings-after-remove.yaml"), "settings-after-remove 与共享 fixture 不一致"
+    cred_before = read_fixture("credentials-before.yaml")
+    cred_after_setup = upsert_credential(cred_before)
+    assert cred_after_setup == read_fixture("credentials-after-setup.yaml"), "credentials-after-setup 与共享 fixture 不一致"
+    assert remove_credential(cred_after_setup) == read_fixture("credentials-after-remove.yaml"), "credentials-after-remove 与共享 fixture 不一致"
+
     print("self-check ok")
 
 
 def apply_remove(*, dry_run: bool) -> None:
-    settings = SETTINGS.read_text() if SETTINGS.exists() else ""
-    cred = CREDENTIALS.read_text() if CREDENTIALS.exists() else ""
-    settings = restore_default_model(remove_ais_codex_provider(settings))
-    cred = remove_credential(cred) if cred else cred
+    with _ConfigLock():
+        settings = SETTINGS.read_text() if SETTINGS.exists() else ""
+        cred = CREDENTIALS.read_text() if CREDENTIALS.exists() else ""
+        settings = restore_default_model(remove_ais_codex_provider(settings))
+        cred = remove_credential(cred) if cred else cred
 
-    if dry_run:
-        print(f"--- {SETTINGS} ---")
-        print(settings or "(empty)")
-        print(f"--- {CREDENTIALS} (是否仍含 {API_KEY_ENV}) ---")
-        print("present" if API_KEY_ENV in cred else "absent")
-        return
+        if dry_run:
+            print(f"--- {SETTINGS} ---")
+            print(settings or "(empty)")
+            print(f"--- {CREDENTIALS} (是否仍含 {API_KEY_ENV}) ---")
+            print("present" if API_KEY_ENV in cred else "absent")
+            return
 
-    if SETTINGS.exists() or settings.strip():
-        write_file(SETTINGS, settings if settings.strip() else "")
-    if CREDENTIALS.exists():
-        write_file(CREDENTIALS, cred if cred.strip() else "version: 1\nrefs:\n", mode=stat.S_IRUSR | stat.S_IWUSR)
-    if DEFAULT_MODEL_BACKUP.exists():
-        DEFAULT_MODEL_BACKUP.unlink()
-    print(f"已移除 {PROVIDER_ID} 与 {API_KEY_ENV}")
-    print("重启 dsh / 新开会话后生效。官方 deepseek-official 不受影响；默认模型已还原（若 --set-default 过）。")
+        if SETTINGS.exists() or settings.strip():
+            write_file(SETTINGS, settings if settings.strip() else "")
+        if CREDENTIALS.exists():
+            write_file(CREDENTIALS, cred if cred.strip() else "version: 1\nrefs:\n", mode=stat.S_IRUSR | stat.S_IWUSR)
+        if DEFAULT_MODEL_BACKUP.exists():
+            DEFAULT_MODEL_BACKUP.unlink()
+        print(f"已移除 {PROVIDER_ID} 与 {API_KEY_ENV}")
+        print("重启 dsh / 新开会话后生效。官方 deepseek-official 不受影响；默认模型已还原（若 --set-default 过）。")
 
 
 def apply_refresh(*, dry_run: bool) -> None:
@@ -672,17 +714,18 @@ def apply_refresh(*, dry_run: bool) -> None:
     for m in models:
         print(f"  - {m['id']}")
 
-    settings = SETTINGS.read_text() if SETTINGS.exists() else ""
-    settings = upsert_ais_codex_provider(settings, models)
+    with _ConfigLock():
+        settings = SETTINGS.read_text() if SETTINGS.exists() else ""
+        settings = upsert_ais_codex_provider(settings, models)
 
-    if dry_run:
-        print(f"\n--- {SETTINGS} ---")
-        print(settings)
-        return
+        if dry_run:
+            print(f"\n--- {SETTINGS} ---")
+            print(settings)
+            return
 
-    write_file(SETTINGS, settings)
-    print(f"\n已刷新 {SETTINGS} 中的模型列表（未改默认模型 / 凭据）")
-    print("重启 dsh / 新开会话后生效。")
+        write_file(SETTINGS, settings)
+        print(f"\n已刷新 {SETTINGS} 中的模型列表（未改默认模型 / 凭据）")
+        print("重启 dsh / 新开会话后生效。")
 
 
 def main() -> None:
@@ -713,32 +756,33 @@ def main() -> None:
     for m in models:
         print(f"  - {m['id']}")
 
-    settings = SETTINGS.read_text() if SETTINGS.exists() else ""
-    settings = upsert_ais_codex_provider(settings, models)
-    if args.set_default:
-        if not args.dry_run:
-            # 先备份当前 agent-default-model，--remove 时原样还原
-            save_default_model_backup(settings)
-        settings = upsert_default_model(settings, pick_default_model(models))
+    with _ConfigLock():
+        settings = SETTINGS.read_text() if SETTINGS.exists() else ""
+        settings = upsert_ais_codex_provider(settings, models)
+        if args.set_default:
+            if not args.dry_run:
+                # 先备份当前 agent-default-model，--remove 时原样还原
+                save_default_model_backup(settings)
+            settings = upsert_default_model(settings, pick_default_model(models))
 
-    cred = CREDENTIALS.read_text() if CREDENTIALS.exists() else "version: 1\nrefs:\n"
-    cred = upsert_credential(cred)
+        cred = CREDENTIALS.read_text() if CREDENTIALS.exists() else "version: 1\nrefs:\n"
+        cred = upsert_credential(cred)
 
-    if args.dry_run:
-        print(f"\n--- {SETTINGS} ---")
-        print(settings)
-        print(f"--- {CREDENTIALS} (只显示是否包含 {API_KEY_ENV}) ---")
-        print("present" if API_KEY_ENV in cred else "missing")
-        return
+        if args.dry_run:
+            print(f"\n--- {SETTINGS} ---")
+            print(settings)
+            print(f"--- {CREDENTIALS} (只显示是否包含 {API_KEY_ENV}) ---")
+            print("present" if API_KEY_ENV in cred else "missing")
+            return
 
-    write_file(SETTINGS, settings)
-    write_file(CREDENTIALS, cred, mode=stat.S_IRUSR | stat.S_IWUSR)
-    print(f"\n已写入 {SETTINGS}")
-    print(f"已写入 {CREDENTIALS}（{API_KEY_ENV}=local，本地代理不校验真 key）")
-    print("下一步：保持 AIS Switch 开着，重启 dsh / 新开会话，模型选")
-    print(f"  {PROVIDER_ID} / {pick_default_model(models)}")
-    if not args.set_default:
-        print("（未改默认模型；需要的话再跑一次并加 --set-default）")
+        write_file(SETTINGS, settings)
+        write_file(CREDENTIALS, cred, mode=stat.S_IRUSR | stat.S_IWUSR)
+        print(f"\n已写入 {SETTINGS}")
+        print(f"已写入 {CREDENTIALS}（{API_KEY_ENV}=local，本地代理不校验真 key）")
+        print("下一步：保持 AIS Switch 开着，重启 dsh / 新开会话，模型选")
+        print(f"  {PROVIDER_ID} / {pick_default_model(models)}")
+        if not args.set_default:
+            print("（未改默认模型；需要的话再跑一次并加 --set-default）")
 
 
 if __name__ == "__main__":

@@ -3,21 +3,30 @@
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-const PROXY: &str = "http://127.0.0.1:15721";
+const DEFAULT_PROXY: &str = "http://127.0.0.1:15721";
 const PROVIDER_ID: &str = "ais-codex";
 const API_KEY_ENV: &str = "AIS_CODEX_API_KEY";
 const API_KEY_VALUE: &str = "local";
 const DISPLAY_NAME: &str = "AIS Switch (Codex)";
-const BASE_URL: &str = "http://127.0.0.1:15721/codex/v1";
 const GATEWAY_PREFIX: &str = "llm-gateway--";
 const DEFAULT_CONTEXT: &str = "1000000";
 const DEFAULT_MAX_TOKENS: &str = "131072";
 /// 接入前 `agent-default-model` 原始段落的备份文件名（放 ~/.dsh 下），移除时原样还原。
 const DEFAULT_MODEL_BACKUP: &str = ".ais-default-model.bak";
+
+/// 代理基址：可用 `AIS_SWITCH_PROXY` 环境变量覆盖（与命令行脚本一致），默认 127.0.0.1:15721。
+fn proxy() -> String {
+    std::env::var("AIS_SWITCH_PROXY").unwrap_or_else(|_| DEFAULT_PROXY.to_string())
+}
+
+fn base_url() -> String {
+    format!("{}/codex/v1", proxy())
+}
 
 #[derive(Clone, serde::Serialize)]
 pub struct AisStep {
@@ -51,6 +60,9 @@ struct GatewayModel {
 }
 
 fn dsh_home() -> Result<PathBuf, String> {
+    if let Ok(h) = std::env::var("DSH_HOME") {
+        return Ok(PathBuf::from(h));
+    }
     let home = std::env::var("HOME").map_err(|_| "无 HOME".to_string())?;
     Ok(PathBuf::from(home).join(".dsh"))
 }
@@ -59,12 +71,40 @@ fn settings_path() -> Result<PathBuf, String> {
     Ok(dsh_home()?.join("settings.yaml"))
 }
 
+/// 当前 dsh 配置目录（用于日志排障），解析失败时返回占位文案。
+pub fn config_home_display() -> String {
+    match dsh_home() {
+        Ok(p) => p.display().to_string(),
+        Err(e) => format!("<解析失败: {e}>"),
+    }
+}
+
 fn credentials_path() -> Result<PathBuf, String> {
     Ok(dsh_home()?.join(".credentials.yaml"))
 }
 
 fn read_or_empty(path: &Path) -> String {
     fs::read_to_string(path).unwrap_or_default()
+}
+
+/// 跨进程互斥锁（与 Python 脚本共用 ~/.dsh/.ais-codex.lock），
+/// 防止 App 与命令行脚本同时读写 settings.yaml / .credentials.yaml。
+fn with_config_lock<T>(f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    let lock_path = dsh_home()?.join(".ais-codex.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|e| format!("无法创建配置锁 {}: {e}", lock_path.display()))?;
+    unsafe {
+        libc::flock(file.as_raw_fd(), libc::LOCK_EX);
+    }
+    let result = f();
+    unsafe {
+        libc::flock(file.as_raw_fd(), libc::LOCK_UN);
+    }
+    result
 }
 
 fn write_with_backup(path: &Path, content: &str, mode: Option<u32>) -> Result<(), String> {
@@ -230,7 +270,7 @@ pub fn check() -> AisCheckResult {
     let mut reply = None;
     let mut proxy_down = false;
 
-    match curl_json_get(&format!("{PROXY}/health"), Duration::from_secs(5)) {
+    match curl_json_get(&format!("{}/health", proxy()), Duration::from_secs(5)) {
         Ok((200, _)) => steps.push(step(true, "/health", "ok")),
         Ok((s, v)) => {
             ok = false;
@@ -242,7 +282,7 @@ pub fn check() -> AisCheckResult {
                 steps: vec![step(
                     false,
                     "/health",
-                    "连不上 127.0.0.1:15721。请打开 AIS Switch，并打开 Codex 路由总开关。",
+                    format!("连不上 {}。请打开 AIS Switch，并打开 Codex 路由总开关。", proxy()),
                 )],
                 models,
                 has_provider: has_provider(&read_or_empty(&settings_path().unwrap_or_default())),
@@ -259,7 +299,7 @@ pub fn check() -> AisCheckResult {
         }
     }
 
-    match curl_json_get(&format!("{PROXY}/status"), Duration::from_secs(5)) {
+    match curl_json_get(&format!("{}/status", proxy()), Duration::from_secs(5)) {
         Ok((200, v)) => {
             let running = v.get("running").and_then(|x| x.as_bool()).unwrap_or(false);
             let port = v.get("port").and_then(|x| x.as_u64()).unwrap_or(0);
@@ -280,7 +320,7 @@ pub fn check() -> AisCheckResult {
         }
     }
 
-    let gw = match curl_json_get(&format!("{PROXY}/codex/v1/models"), Duration::from_secs(8)) {
+    let gw = match curl_json_get(&format!("{}/codex/v1/models", proxy()), Duration::from_secs(8)) {
         Ok((200, v)) => {
             let (gw, all) = parse_gateway_models(&v);
             if gw.is_empty() {
@@ -314,7 +354,7 @@ pub fn check() -> AisCheckResult {
             r#"{{"model":"{mid}","messages":[{{"role":"user","content":"ping"}}],"stream":false}}"#
         );
         match curl_json_post(
-            &format!("{PROXY}/codex/v1/chat/completions"),
+            &format!("{}/codex/v1/chat/completions", proxy()),
             &payload,
             Duration::from_secs(30),
         ) {
@@ -402,100 +442,109 @@ pub fn open_app() -> AisActionResult {
 }
 
 pub fn setup(set_default: bool) -> AisActionResult {
-    let gw = match fetch_gateway_or_err() {
-        Ok(g) => g,
-        Err(e) => return AisActionResult { ok: false, message: e, models: vec![] },
-    };
-    let ids: Vec<String> = gw.iter().map(|m| m.id.clone()).collect();
-    if let Err(e) = apply_setup(&gw, set_default) {
-        return AisActionResult { ok: false, message: e, models: ids };
-    }
-    let extra = if set_default {
-        " 已把默认模型切到 Gateway Flash。"
-    } else {
-        " 未改默认模型。"
-    };
-    AisActionResult {
-        ok: true,
-        message: format!(
-            "已写入 ais-codex（{} 个模型）。保持 AIS Switch 开着，新开会话后选 llm-gateway--deepseek-v4-flash。{extra}",
-            ids.len()
-        ),
-        models: ids,
-    }
+    with_config_lock(|| {
+        let gw = match fetch_gateway_or_err() {
+            Ok(g) => g,
+            Err(e) => return Ok(AisActionResult { ok: false, message: e, models: vec![] }),
+        };
+        let ids: Vec<String> = gw.iter().map(|m| m.id.clone()).collect();
+        if let Err(e) = apply_setup(&gw, set_default) {
+            return Ok(AisActionResult { ok: false, message: e, models: ids });
+        }
+        let extra = if set_default {
+            " 已把默认模型切到 Gateway Flash。"
+        } else {
+            " 未改默认模型。"
+        };
+        Ok(AisActionResult {
+            ok: true,
+            message: format!(
+                "已写入 ais-codex（{} 个模型）。保持 AIS Switch 开着，新开会话后选 llm-gateway--deepseek-v4-flash。{extra}",
+                ids.len()
+            ),
+            models: ids,
+        })
+    })
+    .unwrap_or_else(|e| AisActionResult { ok: false, message: e, models: vec![] })
 }
 
 pub fn refresh() -> AisActionResult {
-    let settings = read_or_empty(&settings_path().unwrap_or_default());
-    if !has_provider(&settings) {
-        return AisActionResult {
-            ok: false,
-            message: "本地还没有 ais-codex，请先点「接入」。".into(),
-            models: vec![],
+    with_config_lock(|| {
+        let settings = read_or_empty(&settings_path().unwrap_or_default());
+        if !has_provider(&settings) {
+            return Ok(AisActionResult {
+                ok: false,
+                message: "本地还没有 ais-codex，请先点「接入」。".into(),
+                models: vec![],
+            });
+        }
+        let gw = match fetch_gateway_or_err() {
+            Ok(g) => g,
+            Err(e) => return Ok(AisActionResult { ok: false, message: e, models: vec![] }),
         };
-    }
-    let gw = match fetch_gateway_or_err() {
-        Ok(g) => g,
-        Err(e) => return AisActionResult { ok: false, message: e, models: vec![] },
-    };
-    let ids: Vec<String> = gw.iter().map(|m| m.id.clone()).collect();
-    let next = upsert_ais_codex_provider(&settings, &gw);
-    let sp = match settings_path() {
-        Ok(p) => p,
-        Err(e) => return AisActionResult { ok: false, message: e, models: ids },
-    };
-    if let Err(e) = write_with_backup(&sp, &next, None) {
-        return AisActionResult { ok: false, message: e, models: ids };
-    }
-    AisActionResult {
-        ok: true,
-        message: format!("已刷新 {} 个 Gateway 模型（未改默认模型 / 凭据）。新开会话后生效。", ids.len()),
-        models: ids,
-    }
+        let ids: Vec<String> = gw.iter().map(|m| m.id.clone()).collect();
+        let next = upsert_ais_codex_provider(&settings, &gw);
+        let sp = match settings_path() {
+            Ok(p) => p,
+            Err(e) => return Ok(AisActionResult { ok: false, message: e, models: ids }),
+        };
+        if let Err(e) = write_with_backup(&sp, &next, None) {
+            return Ok(AisActionResult { ok: false, message: e, models: ids });
+        }
+        Ok(AisActionResult {
+            ok: true,
+            message: format!("已刷新 {} 个 Gateway 模型（未改默认模型 / 凭据）。新开会话后生效。", ids.len()),
+            models: ids,
+        })
+    })
+    .unwrap_or_else(|e| AisActionResult { ok: false, message: e, models: vec![] })
 }
 
 pub fn remove() -> AisActionResult {
-    let sp = match settings_path() {
-        Ok(p) => p,
-        Err(e) => return AisActionResult { ok: false, message: e, models: vec![] },
-    };
-    let cp = match credentials_path() {
-        Ok(p) => p,
-        Err(e) => return AisActionResult { ok: false, message: e, models: vec![] },
-    };
-    let settings = restore_default_model(&remove_ais_codex_provider(&read_or_empty(&sp)));
-    let cred = remove_credential(&read_or_empty(&cp));
-    if sp.exists() || !settings.trim().is_empty() {
-        if let Err(e) = write_with_backup(&sp, &settings, None) {
-            return AisActionResult { ok: false, message: e, models: vec![] };
-        }
-    }
-    if cp.exists() {
-        let body = if cred.trim().is_empty() {
-            "version: 1\nrefs:\n".to_string()
-        } else {
-            cred
+    with_config_lock(|| {
+        let sp = match settings_path() {
+            Ok(p) => p,
+            Err(e) => return Ok(AisActionResult { ok: false, message: e, models: vec![] }),
         };
-        if let Err(e) = write_with_backup(&cp, &body, Some(0o600)) {
-            return AisActionResult { ok: false, message: e, models: vec![] };
+        let cp = match credentials_path() {
+            Ok(p) => p,
+            Err(e) => return Ok(AisActionResult { ok: false, message: e, models: vec![] }),
+        };
+        let settings = restore_default_model(&remove_ais_codex_provider(&read_or_empty(&sp)));
+        let cred = remove_credential(&read_or_empty(&cp));
+        if sp.exists() || !settings.trim().is_empty() {
+            if let Err(e) = write_with_backup(&sp, &settings, None) {
+                return Ok(AisActionResult { ok: false, message: e, models: vec![] });
+            }
         }
-    }
-    // 还原成功后再清掉备份，避免下次接入误用旧快照
-    if let Ok(p) = default_model_backup_path() {
-        let _ = fs::remove_file(p);
-    }
-    AisActionResult {
-        ok: true,
-        message: "已移除 ais-codex 与 AIS_CODEX_API_KEY。官方 DEEPSEEK_API_KEY 未动；默认模型已还原（若接入时设为默认）。新开会话后生效。".into(),
-        models: vec![],
-    }
+        if cp.exists() {
+            let body = if cred.trim().is_empty() {
+                "version: 1\nrefs:\n".to_string()
+            } else {
+                cred
+            };
+            if let Err(e) = write_with_backup(&cp, &body, Some(0o600)) {
+                return Ok(AisActionResult { ok: false, message: e, models: vec![] });
+            }
+        }
+        // 还原成功后再清掉备份，避免下次接入误用旧快照
+        if let Ok(p) = default_model_backup_path() {
+            let _ = fs::remove_file(p);
+        }
+        Ok(AisActionResult {
+            ok: true,
+            message: "已移除 ais-codex 与 AIS_CODEX_API_KEY。官方 DEEPSEEK_API_KEY 未动；默认模型已还原（若接入时设为默认）。新开会话后生效。".into(),
+            models: vec![],
+        })
+    })
+    .unwrap_or_else(|e| AisActionResult { ok: false, message: e, models: vec![] })
 }
 
 fn fetch_gateway_or_err() -> Result<Vec<GatewayModel>, String> {
-    let (status, v) = curl_json_get(&format!("{PROXY}/codex/v1/models"), Duration::from_secs(8))
+    let (status, v) = curl_json_get(&format!("{}/codex/v1/models", proxy()), Duration::from_secs(8))
         .map_err(|e| {
             if e == "connection_refused" {
-                "连不上 AIS Switch（127.0.0.1:15721）。请打开 AIS Switch 并打开 Codex 路由。".into()
+                format!("连不上 AIS Switch（{}）。请打开 AIS Switch 并打开 Codex 路由。", proxy()).into()
             } else {
                 e
             }
@@ -536,7 +585,8 @@ fn apply_setup(models: &[GatewayModel], set_default: bool) -> Result<(), String>
 
 fn provider_yaml(models: &[GatewayModel]) -> String {
     let mut s = format!(
-        "    {PROVIDER_ID}:\n      displayName: {DISPLAY_NAME}\n      api: openai-completions\n      baseURL: {BASE_URL}\n      apiKeyEnv: {API_KEY_ENV}\n      defaultContextWindow: {DEFAULT_CONTEXT}\n      defaultMaxTokens: {DEFAULT_MAX_TOKENS}\n      models:\n"
+        "    {PROVIDER_ID}:\n      displayName: {DISPLAY_NAME}\n      api: openai-completions\n      baseURL: {}\n      apiKeyEnv: {API_KEY_ENV}\n      defaultContextWindow: {DEFAULT_CONTEXT}\n      defaultMaxTokens: {DEFAULT_MAX_TOKENS}\n      models:\n",
+        base_url(),
     );
     for m in models {
         s.push_str(&format!("        - id: {}\n          name: {}\n", m.id, m.name));
@@ -850,7 +900,11 @@ fn replace_top_level_block(settings: &str, key: &str, new_block: &str) -> String
 }
 
 /// 把当前 `agent-default-model` 整段（若存在）备份到指定路径；不存在则存空文件（表示"原本没有"）。
+/// 重复接入时保留第一份（原始）快照，避免二次接入把备份覆盖成 ais-codex。
 fn save_default_model_backup_at(path: &Path, settings: &str) -> Result<(), String> {
+    if path.exists() {
+        return Ok(());
+    }
     let block = split_top_level(settings)
         .into_iter()
         .find(|(k, _)| k == "agent-default-model")
@@ -904,6 +958,12 @@ fn restore_default_model(settings: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    // 集成测试与 fixture 测试都会改 AIS_SWITCH_PROXY / DSH_HOME 环境变量，
+    // Rust 测试默认并行跑，用这把锁串行化这两个环境敏感的测试。
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn sample_models() -> Vec<GatewayModel> {
         vec![
@@ -1005,5 +1065,162 @@ mod tests {
         );
 
         let _ = fs::remove_file(&backup);
+    }
+
+    // ---- mock AIS Switch（本地 HTTP server，纯 std 实现，不引新依赖）----
+
+    fn spawn_mock_ais() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock");
+        let addr = listener.local_addr().expect("addr");
+        let base = format!("http://{addr}");
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                std::thread::spawn(move || {
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                    let mut buf = [0u8; 8192];
+                    let n = stream.read(&mut buf).unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let path = req.split_whitespace().nth(1).unwrap_or("/").split('?').next().unwrap_or("/");
+                    let (status, body) = match path {
+                        "/health" => (200, r#"{"ok":true}"#),
+                        "/status" => (200, r#"{"running":true,"port":15721}"#),
+                        "/codex/v1/models" => (
+                            200,
+                            r#"{"data":[{"id":"llm-gateway--deepseek-v4-flash","cc_switch":{"upstream_model":"deepseek-v4-flash"}},{"id":"llm-gateway--glm-5.2","cc_switch":{"upstream_model":"glm-5.2"}}]}"#,
+                        ),
+                        "/codex/v1/chat/completions" => (200, r#"{"choices":[{"message":{"content":"pong"}}]}"#),
+                        _ => (404, "{}"),
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(resp.as_bytes());
+                });
+            }
+        });
+        base
+    }
+
+    #[test]
+    fn integration_check_setup_refresh_remove() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let base = spawn_mock_ais();
+        let tmp = std::env::temp_dir().join(format!("dsh-ais-it-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        unsafe {
+            std::env::set_var("AIS_SWITCH_PROXY", &base);
+            std::env::set_var("DSH_HOME", &tmp);
+        }
+
+        // 预置：其它 provider + 官方默认模型，验证 remove 时其它 provider 保留、默认模型还原
+        let before = concat!(
+            "ui-theme:\n",
+            "  preference: system\n",
+            "\n",
+            "llm-pi-ai:\n",
+            "  providers:\n",
+            "    other:\n",
+            "      api: openai-completions\n",
+            "      baseURL: http://example.invalid/v1\n",
+            "\n",
+            "agent-default-model:\n",
+            "  provider: deepseek-official\n",
+            "  model: deepseek-v4-flash\n",
+            "  reasoningEffort: high\n",
+        );
+        let sp = tmp.join("settings.yaml");
+        fs::write(&sp, before).unwrap();
+        fs::write(
+            tmp.join(".credentials.yaml"),
+            "version: 1\nrefs:\n  DEEPSEEK_API_KEY: sk-test\n",
+        )
+        .unwrap();
+
+        // 1) check：全通过，拿到 2 个 gateway 模型，尚未接入
+        let r = check();
+        assert!(r.ok, "check 应通过: {:?}", r.steps.iter().map(|s| (&s.name, &s.detail)).collect::<Vec<_>>());
+        assert_eq!(r.models.len(), 2);
+        assert!(!r.proxy_down);
+        assert_eq!(r.reply.as_deref(), Some("pong"));
+        assert!(!r.has_provider);
+
+        // 2) setup(true)：写入 provider + 默认模型 + 凭据；备份默认模型
+        let s = setup(true);
+        assert!(s.ok, "setup: {}", s.message);
+        let after = fs::read_to_string(&sp).unwrap();
+        assert_eq!(after.matches(&format!("    {PROVIDER_ID}:")).count(), 1, "只有一份 ais-codex");
+        assert!(after.contains("provider: ais-codex"));
+        assert!(after.contains("    other:"), "其它 provider 保留");
+        let cred = fs::read_to_string(tmp.join(".credentials.yaml")).unwrap();
+        assert!(cred.contains("AIS_CODEX_API_KEY"));
+        let backup = tmp.join(DEFAULT_MODEL_BACKUP);
+        assert!(backup.exists());
+        assert!(fs::read_to_string(&backup).unwrap().contains("deepseek-official"));
+
+        // 3) setup(true) 再来一次：幂等，不重复
+        let s2 = setup(true);
+        assert!(s2.ok, "setup2: {}", s2.message);
+        let after2 = fs::read_to_string(&sp).unwrap();
+        assert_eq!(after2.matches(&format!("    {PROVIDER_ID}:")).count(), 1);
+
+        // 4) refresh：只刷模型，默认模型 / 凭据不动
+        let r = refresh();
+        assert!(r.ok, "refresh: {}", r.message);
+        let after3 = fs::read_to_string(&sp).unwrap();
+        assert_eq!(after3.matches(&format!("    {PROVIDER_ID}:")).count(), 1);
+        assert!(after3.contains("llm-gateway--glm-5.2"));
+
+        // 5) remove：ais-codex 消失、其它 provider 保留、默认模型还原、凭据清理、备份删除
+        let r = remove();
+        assert!(r.ok, "remove: {}", r.message);
+        let after4 = fs::read_to_string(&sp).unwrap();
+        assert!(!after4.contains(PROVIDER_ID));
+        assert!(after4.contains("    other:"));
+        assert!(after4.contains("provider: deepseek-official"));
+        let cred4 = fs::read_to_string(tmp.join(".credentials.yaml")).unwrap();
+        assert!(!cred4.contains("AIS_CODEX_API_KEY"));
+        assert!(cred4.contains("sk-test"));
+        assert!(!backup.exists(), "备份应已清理");
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// 共享 fixture 契约测试：Rust 与 Python 脚本对同一组 settings.yaml 的变换必须一致。
+    /// fixture 位于 scripts/tests/fixtures/（baseURL 用 __BASE_URL__ 占位，运行时替换，
+    /// 与 AIS_SWITCH_PROXY 环境变量解耦）。
+    #[test]
+    fn fixture_contract_matches() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        // 保证两次 base_url() 调用（变换 + 期望替换）看到同一代理基址
+        unsafe {
+            std::env::remove_var("AIS_SWITCH_PROXY");
+        }
+        let fixtures = concat!(env!("CARGO_MANIFEST_DIR"), "/../scripts/tests/fixtures");
+        let read = |name: &str| -> String {
+            fs::read_to_string(format!("{fixtures}/{name}")).unwrap_or_else(|e| panic!("读取 fixture {name}: {e}"))
+        };
+        let models = sample_models();
+
+        let before = read("settings-before.yaml");
+        let after_setup = upsert_ais_codex_provider(&before, &models);
+        let after_setup = upsert_default_model(&after_setup, &pick_default_model(&models));
+        let expected_setup = read("settings-after-setup.yaml").replace("__BASE_URL__", &base_url());
+        assert_eq!(after_setup, expected_setup, "settings-after-setup 与共享 fixture 不一致（Rust↔Python 漂移？）");
+
+        let after_remove = restore_default_model(&remove_ais_codex_provider(&after_setup));
+        let expected_remove = read("settings-after-remove.yaml");
+        assert_eq!(after_remove, expected_remove, "settings-after-remove 与共享 fixture 不一致（Rust↔Python 漂移？）");
+
+        let cred_before = read("credentials-before.yaml");
+        let cred_after_setup = upsert_credential(&cred_before);
+        let expected_cred_setup = read("credentials-after-setup.yaml");
+        assert_eq!(cred_after_setup, expected_cred_setup, "credentials-after-setup 与共享 fixture 不一致");
+
+        let cred_after_remove = remove_credential(&cred_after_setup);
+        let expected_cred_remove = read("credentials-after-remove.yaml");
+        assert_eq!(cred_after_remove, expected_cred_remove, "credentials-after-remove 与共享 fixture 不一致");
     }
 }
