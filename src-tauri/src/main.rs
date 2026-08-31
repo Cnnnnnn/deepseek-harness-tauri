@@ -1,6 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
@@ -10,7 +10,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use tauri::menu::{Menu, MenuItem, Submenu};
 use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
@@ -634,6 +634,7 @@ struct UsageStats {
     errors: Vec<String>,
 }
 
+#[derive(Clone)]
 struct FileAgg {
     input: u64,
     output: u64,
@@ -643,15 +644,28 @@ struct FileAgg {
     by_model: BTreeMap<String, ModelStat>,
 }
 
-// 从 "key":"value" 形式的文本中提取字符串值
-fn extract_field(line: &str, key: &str) -> Option<String> {
-    let pat = format!("\"{}\":\"", key);
-    let pos = line.find(&pat)?;
-    let start = pos + pat.len();
-    let rest = &line[start..];
-    let end = rest.find('"')?;
-    Some(rest[..end].to_string())
+// 用量统计缓存：按文件（长度 + 修改时间）做增量，余额带 TTL
+struct UsageCache {
+    files: Mutex<HashMap<PathBuf, CachedScan>>,
+    balance: Mutex<Option<(Instant, Option<BalanceInfo>)>>,
 }
+
+struct CachedScan {
+    len: u64,
+    modified: Option<SystemTime>,
+    agg: FileAgg,
+    cwd: Option<String>,
+}
+
+impl Default for UsageCache {
+    fn default() -> Self {
+        UsageCache {
+            files: Mutex::new(HashMap::new()),
+            balance: Mutex::new(None),
+        }
+    }
+}
+
 
 // 从 YAML 行 `KEY: value` 提取（去除首尾引号）
 fn extract_yaml_value(content: &str, key: &str) -> Option<String> {
@@ -666,38 +680,6 @@ fn extract_yaml_value(content: &str, key: &str) -> Option<String> {
     }
 }
 
-// 从 "inputTokens":N 之后解析连续四个整数
-fn parse_u64(s: &str) -> Option<(u64, usize)> {
-    let bytes = s.as_bytes();
-    let mut j = 0;
-    while j < bytes.len() && !bytes[j].is_ascii_digit() {
-        j += 1;
-    }
-    let start = j;
-    while j < bytes.len() && bytes[j].is_ascii_digit() {
-        j += 1;
-    }
-    if j == start {
-        return None;
-    }
-    let v: u64 = s[start..j].parse().ok()?;
-    Some((v, j))
-}
-
-fn parse_usage(s: &str) -> Option<(u64, u64, u64, u64)> {
-    let s = s.strip_prefix("\"inputTokens\":")?;
-    let (input, p1) = parse_u64(s)?;
-    let s = &s[p1..];
-    let s = s.strip_prefix(",\"outputTokens\":")?;
-    let (output, p2) = parse_u64(s)?;
-    let s = &s[p2..];
-    let s = s.strip_prefix(",\"cacheReadTokens\":")?;
-    let (cache, p3) = parse_u64(s)?;
-    let s = &s[p3..];
-    let s = s.strip_prefix(",\"reasoningTokens\":")?;
-    let (reasoning, _p4) = parse_u64(s)?;
-    Some((input, output, cache, reasoning))
-}
 
 // 估算费用（美元），参考 DeepSeek 公开定价，仅供参考
 fn estimate_cost(model: &str, input: u64, cache_read: u64, output: u64) -> f64 {
@@ -749,9 +731,10 @@ fn fetch_balance() -> Option<BalanceInfo> {
 }
 
 fn aggregate_file(path: &PathBuf) -> Result<(FileAgg, Option<String>), String> {
-    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
-    let decompressed = zstd::decode_all(&bytes[..]).map_err(|e| format!("zstd 解压失败: {}", e))?;
-    let text = String::from_utf8_lossy(&decompressed);
+    let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let buf_reader = std::io::BufReader::new(file);
+    let decoder = zstd::stream::read::Decoder::new(buf_reader)
+        .map_err(|e| format!("zstd 解压失败: {e}"))?;
     let mut agg = FileAgg {
         input: 0,
         output: 0,
@@ -761,43 +744,78 @@ fn aggregate_file(path: &PathBuf) -> Result<(FileAgg, Option<String>), String> {
         by_model: BTreeMap::new(),
     };
     let mut cwd = None;
-    for (idx, line) in text.lines().enumerate() {
-        if idx == 0 {
-            cwd = extract_field(line, "cwd");
+    for line in std::io::BufReader::new(decoder).lines() {
+        let line = line.map_err(|e| e.to_string())?;
+        if line.trim().is_empty() {
+            continue;
         }
-        let model = extract_field(line, "model").unwrap_or_default();
-        let mut pos = 0;
-        while let Some(p) = line[pos..].find("\"inputTokens\":") {
-            let abs = pos + p;
-            if let Some((i, o, c, r)) = parse_usage(&line[abs..]) {
-                agg.input += i;
-                agg.output += o;
-                agg.cache_read += c;
-                agg.reasoning += r;
-                agg.calls += 1;
-                if !model.is_empty() {
-                    let e = agg.by_model.entry(model.clone()).or_insert_with(|| ModelStat {
-                        model: model.clone(),
-                        input: 0,
-                        output: 0,
-                        cache_read: 0,
-                        reasoning: 0,
-                        calls: 0,
-                    });
-                    e.input += i;
-                    e.output += o;
-                    e.cache_read += c;
-                    e.reasoning += r;
-                    e.calls += 1;
-                }
-            }
-            pos = abs + 1;
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if cwd.is_none() {
+            cwd = v.get("cwd").and_then(|c| c.as_str()).map(|s| s.to_string());
+        }
+        // 只统计最终的 assistant/message（流式 assistant/chunk 是同一批 usage 的增量，会计重）
+        if v.get("type").and_then(|t| t.as_str()) != Some("assistant/message") {
+            continue;
+        }
+        let Some(usage) = v.pointer("/data/usage") else {
+            continue;
+        };
+        let i = usage
+            .get("inputTokens")
+            .and_then(|n| n.as_u64())
+            .unwrap_or(0);
+        let o = usage
+            .get("outputTokens")
+            .and_then(|n| n.as_u64())
+            .unwrap_or(0);
+        let c = usage
+            .get("cacheReadTokens")
+            .and_then(|n| n.as_u64())
+            .unwrap_or(0);
+        let r = usage
+            .get("reasoningTokens")
+            .and_then(|n| n.as_u64())
+            .unwrap_or(0);
+        agg.input += i;
+        agg.output += o;
+        agg.cache_read += c;
+        agg.reasoning += r;
+        agg.calls += 1;
+        if let Some(model) = v
+            .pointer("/data/message/source/model")
+            .and_then(|m| m.as_str())
+        {
+            let e = agg
+                .by_model
+                .entry(model.to_string())
+                .or_insert_with(|| ModelStat {
+                    model: model.to_string(),
+                    input: 0,
+                    output: 0,
+                    cache_read: 0,
+                    reasoning: 0,
+                    calls: 0,
+                });
+            e.input += i;
+            e.output += o;
+            e.cache_read += c;
+            e.reasoning += r;
+            e.calls += 1;
         }
     }
     Ok((agg, cwd))
 }
 
-fn scan_sessions() -> UsageStats {
+enum BalanceSource {
+    Cached(Option<BalanceInfo>),
+    Fetch(std::thread::JoinHandle<Option<BalanceInfo>>),
+}
+
+fn scan_sessions(app: &tauri::AppHandle) -> UsageStats {
+    const BALANCE_TTL: Duration = Duration::from_secs(5 * 60);
+
     let mut errors: Vec<String> = Vec::new();
     let mut total = TokenBreakdown {
         input: 0,
@@ -811,23 +829,29 @@ fn scan_sessions() -> UsageStats {
     let mut session_count = 0usize;
     let mut scanned_files = 0usize;
 
+    let cache = app.state::<UsageCache>();
+
+    // 余额：命中 TTL 缓存直接复用；否则后台并行拉取，不阻塞扫描
+    let balance_source = {
+        let guard = cache.balance.lock().unwrap();
+        match guard.as_ref() {
+            Some((at, b)) if at.elapsed() < BALANCE_TTL => {
+                let cached = b.clone();
+                drop(guard);
+                BalanceSource::Cached(cached)
+            }
+            _ => {
+                drop(guard);
+                BalanceSource::Fetch(std::thread::spawn(fetch_balance))
+            }
+        }
+    };
+
     let home = std::env::var("HOME").unwrap_or_default();
     let sessions_dir = PathBuf::from(&home).join(".dsh").join("sessions");
     if !sessions_dir.is_dir() {
         errors.push(format!("未找到会话目录: {}", sessions_dir.display()));
-        return UsageStats {
-            total,
-            by_model: vec![],
-            by_session,
-            estimated_cost_usd: 0.0,
-            balance: None,
-            session_count,
-            scanned_files,
-            errors,
-        };
-    }
-
-    if let Ok(ws_entries) = std::fs::read_dir(&sessions_dir) {
+    } else if let Ok(ws_entries) = std::fs::read_dir(&sessions_dir) {
         for ws in ws_entries.flatten() {
             let ws_path = ws.path();
             if !ws_path.is_dir() {
@@ -853,43 +877,74 @@ fn scan_sessions() -> UsageStats {
                     }
                     scanned_files += 1;
                     session_count += 1;
-                    match aggregate_file(&file) {
-                        Ok((agg, cwd)) => {
-                            total.input += agg.input;
-                            total.output += agg.output;
-                            total.cache_read += agg.cache_read;
-                            total.reasoning += agg.reasoning;
-                            total.total +=
-                                agg.input + agg.output + agg.cache_read + agg.reasoning;
-                            for ms in agg.by_model.values() {
-                                let e = by_model.entry(ms.model.clone()).or_insert_with(|| {
-                                    ModelStat {
-                                        model: ms.model.clone(),
-                                        input: 0,
-                                        output: 0,
-                                        cache_read: 0,
-                                        reasoning: 0,
-                                        calls: 0,
-                                    }
-                                });
-                                e.input += ms.input;
-                                e.output += ms.output;
-                                e.cache_read += ms.cache_read;
-                                e.reasoning += ms.reasoning;
-                                e.calls += ms.calls;
+
+                    // 增量：文件未变化则复用上次聚合结果
+                    let meta = std::fs::metadata(&file)
+                        .ok()
+                        .map(|m| (m.len(), m.modified().ok()));
+                    let cached = meta.as_ref().and_then(|(len, modified)| {
+                        let guard = cache.files.lock().unwrap();
+                        guard
+                            .get(&file)
+                            .filter(|c| *len == c.len && *modified == c.modified)
+                            .map(|c| (c.agg.clone(), c.cwd.clone()))
+                    });
+
+                    let (agg, cwd) = if let Some(hit) = cached {
+                        hit
+                    } else {
+                        match aggregate_file(&file) {
+                            Ok((agg, cwd)) => {
+                                if let Some((len, modified)) = meta {
+                                    let mut guard = cache.files.lock().unwrap();
+                                    guard.insert(
+                                        file.clone(),
+                                        CachedScan {
+                                            len,
+                                            modified,
+                                            agg: agg.clone(),
+                                            cwd: cwd.clone(),
+                                        },
+                                    );
+                                }
+                                (agg, cwd)
                             }
-                            by_session.push(SessionStat {
-                                workspace: cwd.unwrap_or(slug.clone()),
-                                session_id,
-                                input: agg.input,
-                                output: agg.output,
-                                cache_read: agg.cache_read,
-                                reasoning: agg.reasoning,
-                                calls: agg.calls,
-                            });
+                            Err(e) => {
+                                errors.push(format!("{}: {}", file.display(), e));
+                                continue;
+                            }
                         }
-                        Err(e) => errors.push(format!("{}: {}", file.display(), e)),
+                    };
+
+                    total.input += agg.input;
+                    total.output += agg.output;
+                    total.cache_read += agg.cache_read;
+                    total.reasoning += agg.reasoning;
+                    total.total += agg.input + agg.output + agg.cache_read + agg.reasoning;
+                    for ms in agg.by_model.values() {
+                        let e = by_model.entry(ms.model.clone()).or_insert_with(|| ModelStat {
+                            model: ms.model.clone(),
+                            input: 0,
+                            output: 0,
+                            cache_read: 0,
+                            reasoning: 0,
+                            calls: 0,
+                        });
+                        e.input += ms.input;
+                        e.output += ms.output;
+                        e.cache_read += ms.cache_read;
+                        e.reasoning += ms.reasoning;
+                        e.calls += ms.calls;
                     }
+                    by_session.push(SessionStat {
+                        workspace: cwd.unwrap_or(slug.clone()),
+                        session_id,
+                        input: agg.input,
+                        output: agg.output,
+                        cache_read: agg.cache_read,
+                        reasoning: agg.reasoning,
+                        calls: agg.calls,
+                    });
                 }
             }
         }
@@ -900,7 +955,15 @@ fn scan_sessions() -> UsageStats {
         cost += estimate_cost(&ms.model, ms.input, ms.cache_read, ms.output);
     }
 
-    let balance = fetch_balance();
+    let balance = match balance_source {
+        BalanceSource::Cached(b) => b,
+        BalanceSource::Fetch(handle) => {
+            let b = handle.join().unwrap_or(None);
+            let mut guard = cache.balance.lock().unwrap();
+            *guard = Some((Instant::now(), b.clone()));
+            b
+        }
+    };
 
     let mut by_model_vec: Vec<ModelStat> = by_model.into_values().collect();
     by_model_vec.sort_by(|a, b| {
@@ -925,8 +988,10 @@ fn scan_sessions() -> UsageStats {
 }
 
 #[tauri::command]
-fn get_usage_stats() -> UsageStats {
-    scan_sessions()
+async fn get_usage_stats(app: tauri::AppHandle) -> Result<UsageStats, String> {
+    tauri::async_runtime::spawn_blocking(move || scan_sessions(&app))
+        .await
+        .map_err(|e| format!("用量统计线程异常：{e}"))
 }
 
 // AIS 体检最坏要串行跑 health/status/models/chat ping（最长 ~48s），
@@ -1225,6 +1290,7 @@ fn main() {
         .manage(QuitFlag(AtomicBool::new(false)))
         .manage(DshPort(Mutex::new(None)))
         .manage(DshVersion(Mutex::new(None)))
+        .manage(UsageCache::default())
         .invoke_handler(tauri::generate_handler![
             get_detect_result,
             install_dsh,
