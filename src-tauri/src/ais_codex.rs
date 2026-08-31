@@ -270,7 +270,19 @@ pub fn check() -> AisCheckResult {
     let mut reply = None;
     let mut proxy_down = false;
 
-    match curl_json_get(&format!("{}/health", proxy()), Duration::from_secs(5)) {
+    // health / status / models 三者互相独立，并行探测（串行最坏 5+5+8=18s）
+    let proxy_base = proxy();
+    let health_url = format!("{proxy_base}/health");
+    let status_url = format!("{proxy_base}/status");
+    let models_url = format!("{proxy_base}/codex/v1/models");
+    let (health_r, status_r, models_r) = std::thread::scope(|scope| {
+        let h = scope.spawn(|| curl_json_get(&health_url, Duration::from_secs(5)));
+        let s = scope.spawn(|| curl_json_get(&status_url, Duration::from_secs(5)));
+        let m = scope.spawn(|| curl_json_get(&models_url, Duration::from_secs(8)));
+        (h.join().unwrap(), s.join().unwrap(), m.join().unwrap())
+    });
+
+    match health_r {
         Ok((200, _)) => steps.push(step(true, "/health", "ok")),
         Ok((s, v)) => {
             ok = false;
@@ -282,7 +294,7 @@ pub fn check() -> AisCheckResult {
                 steps: vec![step(
                     false,
                     "/health",
-                    format!("连不上 {}。请打开 AIS Switch，并打开 Codex 路由总开关。", proxy()),
+                    format!("连不上 {}。请打开 AIS Switch，并打开 Codex 路由总开关。", proxy_base),
                 )],
                 models,
                 has_provider: has_provider(&read_or_empty(&settings_path().unwrap_or_default())),
@@ -299,7 +311,7 @@ pub fn check() -> AisCheckResult {
         }
     }
 
-    match curl_json_get(&format!("{}/status", proxy()), Duration::from_secs(5)) {
+    match status_r {
         Ok((200, v)) => {
             let running = v.get("running").and_then(|x| x.as_bool()).unwrap_or(false);
             let port = v.get("port").and_then(|x| x.as_u64()).unwrap_or(0);
@@ -320,7 +332,7 @@ pub fn check() -> AisCheckResult {
         }
     }
 
-    let gw = match curl_json_get(&format!("{}/codex/v1/models", proxy()), Duration::from_secs(8)) {
+    let gw = match models_r {
         Ok((200, v)) => {
             let (gw, all) = parse_gateway_models(&v);
             if gw.is_empty() {
@@ -1194,9 +1206,14 @@ mod tests {
     #[test]
     fn fixture_contract_matches() {
         let _guard = ENV_LOCK.lock().unwrap();
-        // 保证两次 base_url() 调用（变换 + 期望替换）看到同一代理基址
+        // 隔离 DSH_HOME，避免读到真实的 ~/.dsh/.ais-default-model.bak 导致结果漂移；
+        // 同时保证两次 base_url() 调用（变换 + 期望替换）看到同一代理基址
+        let tmp = std::env::temp_dir().join(format!("dsh-ais-fixture-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
         unsafe {
             std::env::remove_var("AIS_SWITCH_PROXY");
+            std::env::set_var("DSH_HOME", &tmp);
         }
         let fixtures = concat!(env!("CARGO_MANIFEST_DIR"), "/../scripts/tests/fixtures");
         let read = |name: &str| -> String {
@@ -1222,5 +1239,7 @@ mod tests {
         let cred_after_remove = remove_credential(&cred_after_setup);
         let expected_cred_remove = read("credentials-after-remove.yaml");
         assert_eq!(cred_after_remove, expected_cred_remove, "credentials-after-remove 与共享 fixture 不一致");
+
+        let _ = fs::remove_dir_all(&tmp);
     }
 }

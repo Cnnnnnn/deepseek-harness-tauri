@@ -8,7 +8,7 @@ use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -47,20 +47,28 @@ struct InstallProcess(Mutex<Option<i32>>); // 安装进程组 pid
 struct QuitFlag(AtomicBool); // 是否正在退出，用于抑制崩溃自动重启
 struct DshPort(Mutex<Option<u16>>); // 当前 dsh web 端口（用于手动重启时等待就绪）
 struct DshVersion(Mutex<Option<String>>); // 当前 dsh 版本（重启后重注入角标用）
+struct LogFile(Mutex<Option<std::fs::File>>); // install.log 常驻句柄，避免每行 open/close
 
 // ---------- 日志 ----------
 
 fn log_to_file(app: &tauri::AppHandle, line: &str) {
-    if let Ok(dir) = app.path().app_log_dir() {
-        if std::fs::create_dir_all(&dir).is_ok() {
-            if let Ok(mut f) = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(dir.join("install.log"))
-            {
-                let _ = writeln!(f, "{}", line);
+    let state = app.state::<LogFile>();
+    let mut guard = state.0.lock().unwrap();
+    if guard.is_none() {
+        if let Ok(dir) = app.path().app_log_dir() {
+            if std::fs::create_dir_all(&dir).is_ok() {
+                if let Ok(f) = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(dir.join("install.log"))
+                {
+                    *guard = Some(f);
+                }
             }
         }
+    }
+    if let Some(f) = guard.as_mut() {
+        let _ = writeln!(f, "{}", line);
     }
 }
 
@@ -197,6 +205,12 @@ fn find_dsh_candidates() -> Vec<PathBuf> {
     candidates
 }
 
+// 缓存候选列表：一次冷启动里 PATH / nvm 目录不会变，避免重复 spawn bash 登录 shell
+fn find_dsh_candidates_cached() -> Vec<PathBuf> {
+    static CACHE: OnceLock<Vec<PathBuf>> = OnceLock::new();
+    CACHE.get_or_init(find_dsh_candidates).clone()
+}
+
 fn run_dsh_version(dsh_path: &PathBuf) -> Option<String> {
     let dir = dsh_path.parent()?;
     let mut path_env = dir.to_string_lossy().to_string();
@@ -218,14 +232,37 @@ fn run_dsh_version(dsh_path: &PathBuf) -> Option<String> {
     None
 }
 
+// 缓存 dsh --version 结果，避免对同一二进制重复 spawn（启动链路会查多遍）
+fn run_dsh_version_cached(dsh_path: &PathBuf) -> Option<String> {
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, Option<String>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    {
+        let guard = cache.lock().unwrap();
+        if let Some(v) = guard.get(dsh_path) {
+            return v.clone();
+        }
+    }
+    let v = run_dsh_version(dsh_path);
+    cache.lock().unwrap().insert(dsh_path.clone(), v.clone());
+    v
+}
+
 // 选择 dsh：优先匹配目标版本（DSH_PKG 中的版本号，如 0.1.0-rc.7），
 // 避免 PATH 中靠前的旧版（如 rc.6）被误选；无匹配版本时退回第一个能运行的。
 fn select_dsh() -> Option<PathBuf> {
     let target = DSH_PKG.split('@').last().unwrap_or("").trim();
-    let candidates = find_dsh_candidates();
+    let candidates = find_dsh_candidates_cached();
+    // 并行探测各候选版本，避免串行 spawn 拖慢冷启动
+    let versions: Vec<Option<String>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = candidates
+            .iter()
+            .map(|c| scope.spawn(move || run_dsh_version_cached(c)))
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
     let mut first_working: Option<PathBuf> = None;
-    for c in &candidates {
-        if let Some(ver) = run_dsh_version(c) {
+    for (c, ver) in candidates.iter().zip(versions) {
+        if let Some(ver) = ver {
             if first_working.is_none() {
                 first_working = Some(c.clone());
             }
@@ -253,7 +290,7 @@ npm i -g {dsh_pkg} --registry={registry}"#,
 }
 
 fn detect_environment() -> DetectResult {
-    let candidates = find_dsh_candidates();
+    let candidates = find_dsh_candidates_cached();
     let mut problems = Vec::new();
 
     if candidates.is_empty() {
@@ -271,7 +308,7 @@ fn detect_environment() -> DetectResult {
 
     let mut found = false;
     for c in &candidates {
-        if run_dsh_version(c).is_some() {
+        if run_dsh_version_cached(c).is_some() {
             found = true;
             break;
         }
@@ -418,7 +455,7 @@ fn monitor_dsh(app: tauri::AppHandle, dsh_path: PathBuf, port: u16) {
             if exited {
                 break;
             }
-            thread::sleep(Duration::from_millis(300));
+            thread::sleep(Duration::from_millis(1000));
         }
 
         {
@@ -1224,7 +1261,7 @@ fn inject_version_badge(app: &tauri::AppHandle, ver: &str) {
                     "font:12px -apple-system,BlinkMacSystemFont,sans-serif;padding:4px 9px;",
                     "border-radius:6px;pointer-events:none;box-shadow:0 1px 4px rgba(0,0,0,.35)';",
                     "document.body.appendChild(b);}",
-                    "setTimeout(step,1000);}",
+                    "setTimeout(step,5000);}",
                     "step();})();",
                 ]
                 .concat();
@@ -1253,7 +1290,7 @@ fn launch_main(app: &tauri::AppHandle) {
     // 捕获真实运行的 dsh 版本，用于在界面上显示，方便确认当前版本
     let dsh_version = dsh_path
         .as_ref()
-        .and_then(run_dsh_version)
+        .and_then(run_dsh_version_cached)
         .unwrap_or_else(|| "未知".to_string());
 
     let win = WebviewWindowBuilder::new(
@@ -1291,6 +1328,7 @@ fn main() {
         .manage(DshPort(Mutex::new(None)))
         .manage(DshVersion(Mutex::new(None)))
         .manage(UsageCache::default())
+        .manage(LogFile(Mutex::new(None)))
         .invoke_handler(tauri::generate_handler![
             get_detect_result,
             install_dsh,
