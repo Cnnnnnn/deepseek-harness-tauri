@@ -22,7 +22,7 @@
 
 1. 已安装并登录 **AIS Switch**
 2. 打开 **Codex** 路由总开关，智能路由池里已添加 **LLM Gateway**
-3. 本机已能跑 **dsh** / DeepSeek Harness（Node ≥ 22.12，建议 `dsh` = `0.1.1-rc.2`）
+3. 本机已能跑 **dsh** / DeepSeek Harness（Node 22.19+ 或 Node 24+，建议 `dsh` = `0.1.6-alpha.1`，与 App 固定版本保持一致）
 
 命令行脚本仍可用（给没法升级 App 的同事）：`setup-ais-codex.py`
 

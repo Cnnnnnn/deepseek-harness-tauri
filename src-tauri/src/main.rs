@@ -6,9 +6,9 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{mpsc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -22,7 +22,8 @@ const PORT: u16 = 3080;
 const NPM_REGISTRY: &str = "https://registry.npmjs.org";
 const NPM_MIRROR: &str = "https://registry.npmmirror.com";
 // 固定已验证的 dsh 版本，避免上游发破坏性新版本
-const DSH_PKG: &str = "@deepseek-ai/dsh@0.1.1-rc.2";
+// 0.1.6-alpha.1 已实测：首页 200、62/62 前端资源全部 200（对比 0.1.2-alpha.2 曾因 client-runtime 404 导致白屏）
+const DSH_PKG: &str = "@deepseek-ai/dsh@0.1.6-alpha.1";
 const INSTALL_TIMEOUT_SECS: u64 = 15 * 60;
 
 // ---------- 数据结构 ----------
@@ -42,10 +43,18 @@ struct DetectResult {
     install_cmd: String,
 }
 
+#[derive(Clone, serde::Serialize)]
+struct VersionInfo {
+    app_version: String,
+    target_dsh: String,
+    runtime_dsh: String,
+}
+
 struct DshProcess(Mutex<Option<Child>>);
 struct InstallProcess(Mutex<Option<i32>>); // 安装进程组 pid
 struct QuitFlag(AtomicBool); // 是否正在退出，用于抑制崩溃自动重启
 struct DshPort(Mutex<Option<u16>>); // 当前 dsh web 端口（用于手动重启时等待就绪）
+struct DshWebUrl(Mutex<Option<String>>); // dsh 当前带认证 token 的 Web URL
 struct DshVersion(Mutex<Option<String>>); // 当前 dsh 版本（重启后重注入角标用）
 struct LogFile(Mutex<Option<std::fs::File>>); // install.log 常驻句柄，避免每行 open/close
 
@@ -205,10 +214,29 @@ fn find_dsh_candidates() -> Vec<PathBuf> {
     candidates
 }
 
-// 缓存候选列表：一次冷启动里 PATH / nvm 目录不会变，避免重复 spawn bash 登录 shell
+fn dsh_candidates_cache_lock() -> &'static Mutex<Option<Vec<PathBuf>>> {
+    static CACHE: OnceLock<Mutex<Option<Vec<PathBuf>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(None))
+}
+
+fn dsh_version_cache_lock() -> &'static Mutex<HashMap<PathBuf, Option<String>>> {
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, Option<String>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+// 候选列表缓存：一次冷启动里 PATH / nvm 目录基本不变，避免重复 spawn bash 登录 shell。
+// 升级 dsh 后必须能失效，故不用 OnceLock 存值。
 fn find_dsh_candidates_cached() -> Vec<PathBuf> {
-    static CACHE: OnceLock<Vec<PathBuf>> = OnceLock::new();
-    CACHE.get_or_init(find_dsh_candidates).clone()
+    let cache = dsh_candidates_cache_lock();
+    {
+        let guard = cache.lock().unwrap();
+        if let Some(v) = guard.as_ref() {
+            return v.clone();
+        }
+    }
+    let v = find_dsh_candidates();
+    *cache.lock().unwrap() = Some(v.clone());
+    v
 }
 
 fn run_dsh_version(dsh_path: &PathBuf) -> Option<String> {
@@ -234,8 +262,7 @@ fn run_dsh_version(dsh_path: &PathBuf) -> Option<String> {
 
 // 缓存 dsh --version 结果，避免对同一二进制重复 spawn（启动链路会查多遍）
 fn run_dsh_version_cached(dsh_path: &PathBuf) -> Option<String> {
-    static CACHE: OnceLock<Mutex<HashMap<PathBuf, Option<String>>>> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let cache = dsh_version_cache_lock();
     {
         let guard = cache.lock().unwrap();
         if let Some(v) = guard.get(dsh_path) {
@@ -247,10 +274,88 @@ fn run_dsh_version_cached(dsh_path: &PathBuf) -> Option<String> {
     v
 }
 
+/// 升级安装后二进制已原地替换，必须清掉路径/版本缓存再重新探测。
+fn clear_dsh_caches() {
+    *dsh_candidates_cache_lock().lock().unwrap() = None;
+    dsh_version_cache_lock().lock().unwrap().clear();
+}
+
+/// DSH_PKG 中的目标版本号（如 0.1.6-alpha.1）
+fn target_dsh_version() -> &'static str {
+    DSH_PKG.split('@').last().unwrap_or("").trim()
+}
+
+fn normalize_version(v: &str) -> &str {
+    v.trim().trim_start_matches('v')
+}
+
+// alpha 版本的 dsh web 需要使用启动时打印的一次性 token URL。
+fn dsh_url_from_output(line: &str, port: u16) -> Option<String> {
+    let marker = format!("http://{HOST}:{port}/");
+    let start = line.find(&marker)?;
+    let url = line[start..].split_whitespace().next()?;
+    if url.contains("?token=") {
+        Some(url.to_string())
+    } else {
+        None
+    }
+}
+
+fn capture_dsh_url(stdout: Option<ChildStdout>, port: u16) -> mpsc::Receiver<String> {
+    let (sender, receiver) = mpsc::channel();
+    if let Some(stdout) = stdout {
+        thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            let mut line = String::new();
+            let mut sent = false;
+            loop {
+                line.clear();
+                match reader.read_line(&mut line) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) if !sent => {
+                        if let Some(url) = dsh_url_from_output(&line, port) {
+                            let _ = sender.send(url);
+                            sent = true;
+                        }
+                    }
+                    Ok(_) => {}
+                }
+            }
+        });
+    }
+    receiver
+}
+
+fn current_dsh_web_url(app: &tauri::AppHandle) -> String {
+    if let Some(url) = app.state::<DshWebUrl>()
+        .0
+        .lock()
+        .unwrap()
+        .clone()
+    {
+        return url;
+    }
+    let port = app.state::<DshPort>().0.lock().unwrap().unwrap_or(PORT);
+    format!("http://{HOST}:{port}")
+}
+
+fn navigate_main_to_dsh(app: &tauri::AppHandle) {
+    let url = current_dsh_web_url(app);
+    let Ok(js_url) = serde_json::to_string(&url) else {
+        return;
+    };
+    let app2 = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        if let Some(w) = app2.get_webview_window("main") {
+            let _ = w.eval(&format!("window.location.href={js_url};"));
+        }
+    });
+}
+
 // 选择 dsh：优先匹配目标版本（DSH_PKG 中的版本号，如 0.1.0-rc.7），
 // 避免 PATH 中靠前的旧版（如 rc.6）被误选；无匹配版本时退回第一个能运行的。
 fn select_dsh() -> Option<PathBuf> {
-    let target = DSH_PKG.split('@').last().unwrap_or("").trim();
+    let target = target_dsh_version();
     let candidates = find_dsh_candidates_cached();
     // 并行探测各候选版本，避免串行 spawn 拖慢冷启动
     let versions: Vec<Option<String>> = std::thread::scope(|scope| {
@@ -267,7 +372,7 @@ fn select_dsh() -> Option<PathBuf> {
                 first_working = Some(c.clone());
             }
             // 版本输出形如 "0.1.0-rc.7"，兼容可能的 "v" 前缀或前后空白
-            if ver.trim_start_matches('v').trim() == target {
+            if normalize_version(&ver) == target {
                 return Some(c.clone());
             }
         }
@@ -283,9 +388,10 @@ nvm install 22
 nvm use 22
 mkdir -p "$HOME/.local/npm-cache"
 export npm_config_cache="$HOME/.local/npm-cache"
-npm i -g {dsh_pkg} --registry={registry}"#,
+npm i -g --prefer-online {dsh_pkg} --registry={registry} || npm i -g --prefer-online {dsh_pkg} --registry={mirror}"#,
         dsh_pkg = DSH_PKG,
         registry = NPM_REGISTRY,
+        mirror = NPM_MIRROR,
     )
 }
 
@@ -297,7 +403,7 @@ fn detect_environment() -> DetectResult {
         problems.push(Problem {
             problem_type: "dsh-missing".into(),
             title: "未检测到 DeepSeek Harness (dsh)".into(),
-            detail: format!("需要 Node ≥ 22.12 以及 {}", DSH_PKG),
+            detail: format!("需要 Node 22.19+（或 Node 24+）以及 {}", DSH_PKG),
         });
         return DetectResult {
             ok: false,
@@ -319,7 +425,7 @@ fn detect_environment() -> DetectResult {
             problem_type: "node-incompatible".into(),
             title: "dsh 已安装但无法运行".into(),
             detail: format!(
-                "通常是 Node 版本过低（dsh 需要 Node ≥ 20.19 / 22.12）。当前 Node: {}。建议安装 Node 22。",
+                "通常是 Node 版本过低（dsh 需要 Node 22.19+ 或 Node 24+）。当前 Node: {}。建议安装 Node 22。",
                 current_node_version()
             ),
         });
@@ -368,13 +474,13 @@ if [ -d "$HOME/.npm" ] && [ ! -w "$HOME/.npm" ]; then
   sudo -n chown -R "$(whoami)" "$HOME/.npm" 2>/dev/null && log "sudo chown 成功" || log "sudo 跳过，已使用独立缓存继续安装"
 fi
 
-if npm i -g "$DSH_PKG" --registry="$REG" 2>/dev/null; then
+if npm i -g --prefer-online "$DSH_PKG" --registry="$REG" 2>/dev/null; then
   log "官方 registry 安装成功"
-elif npm i -g "$DSH_PKG" --registry="$MIRROR" 2>/dev/null; then
+elif npm i -g --prefer-online "$DSH_PKG" --registry="$MIRROR" 2>/dev/null; then
   log "npmmirror 镜像安装成功"
 else
   log "全局安装失败，fallback 到 --prefix=$HOME/.local（npmmirror）"
-  npm i -g --prefix="$HOME/.local" "$DSH_PKG" --registry="$MIRROR"
+  npm i -g --prefix="$HOME/.local" --prefer-online "$DSH_PKG" --registry="$MIRROR"
 fi
 
 stage verify
@@ -403,22 +509,55 @@ fn start_dsh(dsh_path: &PathBuf, port: u16) -> Result<Child, String> {
         // rc.8 起 dsh web 默认自动打开系统浏览器，封装使用内嵌 webview，必须禁用
         .args(["web", "--host", HOST, "--port", &port.to_string(), "--no-open"])
         .env("PATH", path_env)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::piped())
+        // 保留 stderr：崩溃/启动失败时写入 install.log，便于排障
+        .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| e.to_string())
+}
+
+/// 把子进程 stderr 逐行落到日志（前缀 [dsh:err]）
+fn pipe_stderr_to_log(app: &tauri::AppHandle, child: &mut Child) {
+    let Some(stderr) = child.stderr.take() else {
+        return;
+    };
+    let app = app.clone();
+    thread::spawn(move || {
+        let reader = BufReader::new(stderr);
+        for line in reader.lines() {
+            match line {
+                Ok(l) if !l.trim().is_empty() => {
+                    emit_log(&app, &format!("[dsh:err] {}", l.trim_end()));
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+    });
+}
+
+/// 导航白名单：仅允许访问本机 dsh 的 http + 固定端口，防止跳到同机其它服务。
+fn navigation_allowed(scheme: &str, host: Option<&str>, port: Option<u16>, expect_port: u16) -> bool {
+    scheme == "http" && host == Some(HOST) && port == Some(expect_port)
 }
 
 // 带重试地启动 dsh web（固定端口，失败/超时则重试 attempts 次）
 fn start_dsh_with_retry(app: &tauri::AppHandle, dsh_path: &PathBuf, port: u16, attempts: u32) -> bool {
     for i in 1..=attempts {
         match start_dsh(dsh_path, port) {
-            Ok(child) => {
+            Ok(mut child) => {
+                *app.state::<DshWebUrl>().0.lock().unwrap() = None;
+                let url_receiver = capture_dsh_url(child.stdout.take(), port);
+                pipe_stderr_to_log(app, &mut child);
                 {
                     let state = app.state::<DshProcess>();
                     *state.0.lock().unwrap() = Some(child);
                 }
                 if wait_for_port(HOST, port, Duration::from_secs(20)) {
+                    if let Ok(url) = url_receiver.recv_timeout(Duration::from_secs(3)) {
+                        *app.state::<DshWebUrl>().0.lock().unwrap() = Some(url);
+                    }
+                    navigate_main_to_dsh(app);
                     return true;
                 }
                 emit_log(app, &format!("[dsh] 启动超时（第 {i}/{attempts} 次）"));
@@ -499,6 +638,27 @@ fn kill_install_group(app: &tauri::AppHandle) {
 #[tauri::command]
 fn get_detect_result() -> DetectResult {
     detect_environment()
+}
+
+fn version_info() -> VersionInfo {
+    VersionInfo {
+        app_version: env!("CARGO_PKG_VERSION").to_string(),
+        target_dsh: DSH_PKG.to_string(),
+        runtime_dsh: "未启动".to_string(),
+    }
+}
+
+#[tauri::command]
+fn get_version_info(app: tauri::AppHandle) -> VersionInfo {
+    let mut info = version_info();
+    info.runtime_dsh = app
+        .state::<DshVersion>()
+        .0
+        .lock()
+        .unwrap()
+        .clone()
+        .unwrap_or_else(|| "未启动".to_string());
+    info
 }
 
 #[tauri::command]
@@ -1131,6 +1291,241 @@ fn open_usage_window(app: &tauri::AppHandle) {
         .build();
 }
 
+// 打开版本变更窗口（单例）
+fn open_changelog_window(app: &tauri::AppHandle) {
+    if let Some(w) = app.get_webview_window("changelog") {
+        let _ = w.show();
+        let _ = w.set_focus();
+        return;
+    }
+    let _ = WebviewWindowBuilder::new(app, "changelog", WebviewUrl::App("changelog.html".into()))
+        .title("版本变更")
+        .inner_size(760.0, 700.0)
+        .min_inner_size(640.0, 560.0)
+        .build();
+}
+
+// ---------- dsh 版本升级 ----------
+
+#[derive(Clone, serde::Serialize)]
+struct DshUpgradeInfo {
+    target: String,
+    current: Option<String>,
+    needs_upgrade: bool,
+}
+
+fn current_runtime_dsh_version(app: &tauri::AppHandle) -> Option<String> {
+    if let Some(v) = app.state::<DshVersion>().0.lock().unwrap().clone() {
+        return Some(v);
+    }
+    select_dsh().and_then(|p| run_dsh_version_cached(&p))
+}
+
+fn dsh_upgrade_info(app: &tauri::AppHandle) -> DshUpgradeInfo {
+    let target = target_dsh_version().to_string();
+    let current = current_runtime_dsh_version(app);
+    let needs_upgrade = match &current {
+        Some(c) => normalize_version(c) != target,
+        None => true,
+    };
+    DshUpgradeInfo {
+        target,
+        current,
+        needs_upgrade,
+    }
+}
+
+#[tauri::command]
+fn get_dsh_upgrade_info(app: tauri::AppHandle) -> DshUpgradeInfo {
+    dsh_upgrade_info(&app)
+}
+
+#[derive(Clone, serde::Serialize)]
+struct UpgradeResult {
+    ok: bool,
+    message: String,
+    version: Option<String>,
+}
+
+/// 跑一键安装脚本并把输出落到 install.log，返回是否 exit 0。
+fn run_install_script_logged(app: &tauri::AppHandle) -> bool {
+    let script = build_install_script();
+    let mut child = match Command::new("/bin/bash")
+        .arg("-c")
+        .arg(&script)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            emit_log(app, &format!("[upgrade] 启动安装进程失败: {e}"));
+            return false;
+        }
+    };
+    let pid = child.id() as i32;
+    {
+        let state = app.state::<InstallProcess>();
+        *state.0.lock().unwrap() = Some(pid);
+    }
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let app_out = app.clone();
+    let t1 = thread::spawn(move || {
+        if let Some(out) = stdout {
+            for line in BufReader::new(out).lines().map_while(Result::ok) {
+                emit_log(&app_out, &line);
+            }
+        }
+    });
+    let app_err = app.clone();
+    let t2 = thread::spawn(move || {
+        if let Some(err) = stderr {
+            for line in BufReader::new(err).lines().map_while(Result::ok) {
+                emit_log(&app_err, &line);
+            }
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(INSTALL_TIMEOUT_SECS);
+    let mut success = false;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                success = status.success();
+                break;
+            }
+            Ok(None) => {}
+            Err(_) => break,
+        }
+        if Instant::now() > deadline {
+            emit_log(app, "[upgrade] 安装超时，终止进程组");
+            unsafe { libc::kill(-pid, libc::SIGKILL); }
+            break;
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+    {
+        let state = app.state::<InstallProcess>();
+        *state.0.lock().unwrap() = None;
+    }
+    let _ = t1.join();
+    let _ = t2.join();
+    success
+}
+
+/// 一键把本机 dsh 升到 DSH_PKG 固定版本，并重启子进程使其生效。
+fn upgrade_dsh_impl(app: &tauri::AppHandle) -> UpgradeResult {
+    let target = target_dsh_version().to_string();
+    emit_log(app, &format!("[upgrade] 开始升级 dsh 到 {target} ..."));
+    if !run_install_script_logged(app) {
+        return UpgradeResult {
+            ok: false,
+            message: "升级安装失败，请到「环境检查 / 安装日志」查看，或手动执行安装命令。".into(),
+            version: None,
+        };
+    }
+    clear_dsh_caches();
+    let Some(path) = select_dsh() else {
+        return UpgradeResult {
+            ok: false,
+            message: "升级后未找到可用的 dsh，请检查 PATH / nvm。".into(),
+            version: None,
+        };
+    };
+    let Some(ver) = run_dsh_version_cached(&path) else {
+        return UpgradeResult {
+            ok: false,
+            message: "升级后 dsh 无法运行（可能是 Node 版本不兼容）。".into(),
+            version: None,
+        };
+    };
+    if normalize_version(&ver) != target {
+        return UpgradeResult {
+            ok: false,
+            message: format!(
+                "升级后版本为 {ver}，仍不等于目标 {target}。可能是候选路径里旧版优先，请手动 npm i -g 到当前 Node 的 prefix。"
+            ),
+            version: Some(ver),
+        };
+    }
+
+    // 杀掉当前子进程；monitor_dsh 会用同一路径（npm -g 原地覆盖）在同端口拉起新版本
+    {
+        let state = app.state::<DshProcess>();
+        let mut guard = state.0.lock().unwrap();
+        if let Some(c) = guard.as_mut() {
+            let _ = c.kill();
+        }
+    }
+    let port = app
+        .state::<DshPort>()
+        .0
+        .lock()
+        .unwrap()
+        .unwrap_or(PORT);
+    if !wait_for_port_free_then_up(app, port) {
+        return UpgradeResult {
+            ok: false,
+            message: format!("dsh {ver} 已安装，但进程重启超时，请手动重启应用。"),
+            version: Some(ver),
+        };
+    }
+    *app.state::<DshVersion>().0.lock().unwrap() = Some(ver.clone());
+    inject_version_badge(app, &ver);
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.set_title(&format!("DeepSeek Harness · dsh {ver}"));
+    }
+    emit_log(app, &format!("[upgrade] 升级完成，运行版本 {ver}"));
+    UpgradeResult {
+        ok: true,
+        message: format!("dsh 已升级到 {ver}，并已重启生效。"),
+        version: Some(ver),
+    }
+}
+
+/// kill 后等端口释放再被 monitor 拉起：先等旧端口空出，再等新进程监听上。
+fn wait_for_port_free_then_up(_app: &tauri::AppHandle, port: u16) -> bool {
+    let start = Instant::now();
+    // 等旧进程真正退出（端口释放），最多 5s
+    while start.elapsed() < Duration::from_secs(5) {
+        if !port_in_use(HOST, port) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(150));
+    }
+    // monitor_dsh 轮询间隔 1s + 启动最多 20s
+    wait_for_port(HOST, port, Duration::from_secs(25))
+}
+
+#[tauri::command]
+async fn upgrade_dsh(app: tauri::AppHandle) -> Result<UpgradeResult, String> {
+    tauri::async_runtime::spawn_blocking(move || upgrade_dsh_impl(&app))
+        .await
+        .map_err(|e| format!("升级线程异常：{e}"))
+}
+
+#[tauri::command]
+fn close_upgrade_window(app: tauri::AppHandle) {
+    if let Some(w) = app.get_webview_window("upgrade") {
+        let _ = w.close();
+    }
+}
+
+fn open_upgrade_window(app: &tauri::AppHandle) {
+    if let Some(w) = app.get_webview_window("upgrade") {
+        let _ = w.show();
+        let _ = w.set_focus();
+        let _ = w.eval("window.__upgradeRefresh && window.__upgradeRefresh()");
+        return;
+    }
+    let _ = WebviewWindowBuilder::new(app, "upgrade", WebviewUrl::App("upgrade.html".into()))
+        .title("升级 dsh")
+        .inner_size(520.0, 420.0)
+        .min_inner_size(440.0, 360.0)
+        .build();
+}
+
 // 一键重启 dsh 使配置生效：杀掉子进程，等 monitor_dsh 在同端口自动拉起，并刷新主窗口
 #[tauri::command]
 async fn ais_switch_restart_dsh(app: tauri::AppHandle) -> Result<ais_codex::AisActionResult, String> {
@@ -1189,14 +1584,8 @@ fn restart_dsh_inner(app: &tauri::AppHandle) -> ais_codex::AisActionResult {
             models: vec![],
         };
     }
-    // 刷新主窗口，让新的 provider / 模型列表立即生效
-    let app2 = app.clone();
-    let _ = app.run_on_main_thread(move || {
-        if let Some(w) = app2.get_webview_window("main") {
-            let _ = w.eval("window.location.reload()");
-        }
-    });
-    // reload 会清掉版本角标，等页面加载后重注入
+    // 新版 dsh 每次启动都会生成新 token，start_dsh_with_retry 已导航到新 URL。
+    // 导航会清掉版本角标，等页面加载后重注入。
     if let Some(ver) = app.state::<DshVersion>().0.lock().unwrap().clone() {
         inject_version_badge(app, &ver);
     }
@@ -1224,14 +1613,16 @@ fn open_ais_window(app: &tauri::AppHandle) {
 
 fn build_app_menu(app: &tauri::App) -> Result<tauri::menu::Menu<tauri::Wry>, Box<dyn std::error::Error>> {
     // macOS 顶栏菜单；不要往 Menu 根上直接塞 MenuItem（不容易看见）
+    let changelog_item = MenuItem::with_id(app, "version_changelog", "版本变更…", true, None::<&str>)?;
     let usage_item = MenuItem::with_id(app, "usage_stats", "用量统计", true, None::<&str>)?;
     let ais_item = MenuItem::with_id(app, "ais_switch", "AIS Switch…", true, None::<&str>)?;
+    let upgrade_item = MenuItem::with_id(app, "upgrade_dsh", "升级 dsh…", true, None::<&str>)?;
     let tools = Submenu::with_id_and_items(
         app,
         "tools",
         "工具",
         true,
-        &[&usage_item, &ais_item],
+        &[&changelog_item, &usage_item, &ais_item, &upgrade_item],
     )?;
     let menu = Menu::default(app.handle())?;
     menu.append(&tools)?;
@@ -1273,10 +1664,11 @@ fn inject_version_badge(app: &tauri::AppHandle, ver: &str) {
 
 fn launch_main(app: &tauri::AppHandle) {
     let dsh_path = select_dsh();
+    let mut nav_port = PORT;
 
-    let mut port = PORT;
     if let Some(path) = &dsh_path {
-        port = find_free_port(PORT);
+        let port = find_free_port(PORT);
+        nav_port = port;
         *app.state::<DshPort>().0.lock().unwrap() = Some(port);
         if start_dsh_with_retry(app, path, port, 3) {
             let app_clone = app.clone();
@@ -1296,11 +1688,13 @@ fn launch_main(app: &tauri::AppHandle) {
     let win = WebviewWindowBuilder::new(
         app,
         "main",
-        WebviewUrl::External(format!("http://{HOST}:{port}").parse().unwrap()),
+        WebviewUrl::External(current_dsh_web_url(app).parse().unwrap()),
     )
     .title(format!("DeepSeek Harness · dsh {dsh_version}"))
     .inner_size(1280.0, 820.0)
-    .on_navigation(|url| url.host_str() == Some(HOST))
+    .on_navigation(move |url| {
+        navigation_allowed(url.scheme(), url.host_str(), url.port(), nav_port)
+    })
     .build();
 
     // 在 dsh web 页面注入常驻角标，显示当前 dsh 版本（自修复：应对 SPA 重渲染）
@@ -1326,11 +1720,13 @@ fn main() {
         .manage(InstallProcess(Mutex::new(None)))
         .manage(QuitFlag(AtomicBool::new(false)))
         .manage(DshPort(Mutex::new(None)))
+        .manage(DshWebUrl(Mutex::new(None)))
         .manage(DshVersion(Mutex::new(None)))
         .manage(UsageCache::default())
         .manage(LogFile(Mutex::new(None)))
         .invoke_handler(tauri::generate_handler![
             get_detect_result,
+            get_version_info,
             install_dsh,
             cancel_precheck,
             get_usage_stats,
@@ -1339,7 +1735,10 @@ fn main() {
             ais_switch_refresh,
             ais_switch_remove,
             ais_switch_open_app,
-            ais_switch_restart_dsh
+            ais_switch_restart_dsh,
+            get_dsh_upgrade_info,
+            upgrade_dsh,
+            close_upgrade_window
         ])
         .setup(|app| {
             // 菜单栏加入「用量统计」入口
@@ -1348,8 +1747,10 @@ fn main() {
             }
             app.on_menu_event(|app, event| {
                 match event.id().as_ref() {
+                    "version_changelog" => open_changelog_window(app),
                     "usage_stats" => open_usage_window(app),
                     "ais_switch" => open_ais_window(app),
+                    "upgrade_dsh" => open_upgrade_window(app),
                     _ => {}
                 }
             });
@@ -1357,6 +1758,10 @@ fn main() {
             let result = detect_environment();
             if result.ok {
                 launch_main(app.handle());
+                // 运行版本与 DSH_PKG 不一致时，弹出一键升级（不阻塞主窗口）
+                if dsh_upgrade_info(app.handle()).needs_upgrade {
+                    open_upgrade_window(app.handle());
+                }
             } else {
                 let _ = WebviewWindowBuilder::new(app, "precheck", WebviewUrl::App("index.html".into()))
                     .title("DeepSeek Harness 环境检查")
@@ -1378,4 +1783,67 @@ fn main() {
                 }
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{dsh_url_from_output, navigation_allowed, normalize_version, target_dsh_version, version_info};
+
+    #[test]
+    fn extracts_tokenized_web_url_for_expected_port() {
+        let line = "dsh web: http://127.0.0.1:3080/?token=abc-123\n";
+        assert_eq!(
+            dsh_url_from_output(line, 3080),
+            Some("http://127.0.0.1:3080/?token=abc-123".to_string())
+        );
+    }
+
+    #[test]
+    fn ignores_bare_or_wrong_port_urls() {
+        assert_eq!(dsh_url_from_output("http://127.0.0.1:3080/", 3080), None);
+        assert_eq!(
+            dsh_url_from_output("dsh web: http://127.0.0.1:3081/?token=abc", 3080),
+            None
+        );
+    }
+
+    #[test]
+    fn navigation_only_allows_same_http_port() {
+        assert!(navigation_allowed("http", Some("127.0.0.1"), Some(3080), 3080));
+        // 其它端口 / 协议 / 主机一律拒绝，避免跳到同机其它服务
+        assert!(!navigation_allowed("http", Some("127.0.0.1"), Some(3081), 3080));
+        assert!(!navigation_allowed("http", Some("127.0.0.1"), Some(80), 3080));
+        assert!(!navigation_allowed("https", Some("127.0.0.1"), Some(3080), 3080));
+        assert!(!navigation_allowed("http", Some("example.com"), Some(3080), 3080));
+        assert!(!navigation_allowed("http", None, Some(3080), 3080));
+        assert!(!navigation_allowed("http", Some("127.0.0.1"), None, 3080));
+    }
+
+    #[test]
+    fn target_version_is_plain_semver_without_pkg_prefix() {
+        let t = target_dsh_version();
+        assert!(!t.contains('@'), "target 不应含包名分隔符: {t}");
+        assert!(t.contains('.'), "target 应是版本号: {t}");
+        assert_eq!(normalize_version("  v0.1.6-alpha.1\n"), "0.1.6-alpha.1");
+        assert_eq!(normalize_version(t), t);
+    }
+
+    #[test]
+    fn version_change_page_documents_current_versions() {
+        let page = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../precheck/changelog.html"));
+        let info = version_info();
+        assert!(page.contains("版本变更"));
+        assert!(page.contains(&info.target_dsh));
+        assert!(page.contains("DeepSeek Harness 上游更新"));
+        assert!(page.contains("0.1.6-alpha.1 新增能力"));
+        assert!(page.contains("0.1.5-rc.2"));
+        assert!(page.contains("DeepSeek-V41-Flash"));
+        assert!(page.contains("通用文件"));
+        assert!(page.contains("在应用中打开"));
+        assert!(page.contains("Session V3"));
+        assert!(page.contains("get_version_info"));
+        // 1.0.15：一键升级 + stderr/导航收紧
+        assert!(page.contains("一键升级"));
+        assert!(page.contains("stderr"));
+    }
 }

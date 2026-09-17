@@ -6,3 +6,5 @@ src-tauri/gen/schemas/
 *.dmg
 *.blockmap
 .DS_Store
+.workbuddy/
+.serena/

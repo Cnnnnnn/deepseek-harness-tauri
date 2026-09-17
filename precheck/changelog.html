@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <title>版本变更</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Helvetica Neue", sans-serif;
+      background: #f6f7f9;
+      color: #1f2329;
+      padding: 24px 26px 32px;
+      -webkit-user-select: none;
+      user-select: none;
+    }
+    .eyebrow { color: #2563eb; font-size: 11px; font-weight: 700; letter-spacing: .08em; margin-bottom: 6px; }
+    h1 { font-size: 21px; font-weight: 650; margin-bottom: 5px; }
+    .lede { color: #6b7280; font-size: 13px; line-height: 1.5; margin-bottom: 16px; }
+    .version-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 15px; }
+    .version-card, .section { background: #fff; border: 1px solid #e5e7eb; border-radius: 11px; }
+    .version-card { padding: 13px 14px; min-height: 82px; }
+    .version-card .label { color: #6b7280; font-size: 12px; margin-bottom: 7px; }
+    .version-card .value { color: #111827; font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 16px; font-weight: 700; overflow-wrap: anywhere; }
+    .version-card.accent { background: #eff6ff; border-color: #bfdbfe; }
+    .version-card.accent .value { color: #1d4ed8; }
+    .section { padding: 16px 17px; margin-bottom: 14px; }
+    .section h2 { font-size: 14px; font-weight: 650; margin-bottom: 12px; }
+    .section-intro { color: #6b7280; font-size: 12px; line-height: 1.6; margin: -3px 0 12px; }
+    .change { display: grid; grid-template-columns: 28px 1fr; gap: 10px; align-items: start; padding: 9px 0; border-top: 1px solid #f0f1f3; }
+    .change:first-of-type { border-top: 0; padding-top: 0; }
+    .change:last-of-type { padding-bottom: 0; }
+    .number { width: 26px; height: 26px; border-radius: 8px; background: #eff6ff; color: #2563eb; display: grid; place-items: center; font-size: 11px; font-weight: 700; }
+    .change h3 { font-size: 13px; font-weight: 600; margin-bottom: 3px; }
+    .change p, .tip { color: #6b7280; font-size: 12px; line-height: 1.6; }
+    code { background: #f3f4f6; border-radius: 4px; color: #374151; font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 11px; padding: 2px 4px; }
+    .tip { background: #fffbeb; border: 1px solid #fde68a; border-radius: 8px; color: #92400e; padding: 10px 12px; }
+    .footer { color: #9ca3af; font-size: 11px; line-height: 1.5; }
+    @media (max-width: 620px) { .version-grid { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <div class="eyebrow">DEEPSEEK HARNESS · CHANGELOG</div>
+  <h1>版本变更</h1>
+  <p class="lede">这里记录当前封装版本、实际运行版本，以及最近一次升级带来的变化。</p>
+
+  <div class="version-grid">
+    <div class="version-card accent"><div class="label">App 当前版本</div><div class="value" id="app-version">1.0.15</div></div>
+    <div class="version-card"><div class="label">dsh 目标版本</div><div class="value" id="target-dsh">0.1.6-alpha.1</div></div>
+    <div class="version-card"><div class="label">dsh 实际运行版本</div><div class="value" id="runtime-dsh">读取中…</div></div>
+  </div>
+
+  <section class="section">
+    <h2>1.0.15 封装改进</h2>
+    <p class="section-intro">相对此前未发布的 1.0.14 本地构建，补上了升级链路与排障/安全收紧。</p>
+    <div class="change">
+      <div class="number">01</div>
+      <div><h3>一键升级 dsh</h3><p>运行版本与固定目标版本不一致时自动弹出升级窗口，也可从菜单「工具 → 升级 dsh…」随时打开；升级会执行 npm 全局安装、清缓存并重启子进程。</p></div>
+    </div>
+    <div class="change">
+      <div class="number">02</div>
+      <div><h3>保留 dsh stderr</h3><p>子进程 stderr 不再丢弃，崩溃或启动失败时以 <code>[dsh:err]</code> 前缀写入 install.log，便于定位问题。</p></div>
+    </div>
+    <div class="change">
+      <div class="number">03</div>
+      <div><h3>收紧主窗口导航</h3><p>内嵌页面仅允许访问 <code>http://127.0.0.1</code> 且端口必须等于本次 dsh 监听端口，避免被导航到同机其它服务。</p></div>
+    </div>
+  </section>
+
+  <section class="section">
+    <h2>0.1.6-alpha.1 新增能力</h2>
+    <p class="section-intro">本次从 <code>0.1.5-rc.2</code> 升级到 <code>0.1.6-alpha.1</code>，上游带来的主要变化。</p>
+    <div class="change">
+      <div class="number">01</div>
+      <div><h3>侧边栏终端</h3><p>Web 侧边栏新增终端，支持多标签、Shell 选择，刷新后可恢复会话。</p></div>
+    </div>
+    <div class="change">
+      <div class="number">02</div>
+      <div><h3>已归档会话</h3><p>设置中新增已归档会话列表，支持查看和恢复；同时修复会话最近更新的排序，新建空白会话置顶。</p></div>
+    </div>
+    <div class="change">
+      <div class="number">03</div>
+      <div><h3>MCP 资源能力</h3><p>支持发现和读取 MCP 资源、使用 URI 模板；MCP 升级至官方 SDK v2，支持协议协商与工具分页。内置 Profile 配置 MCP 服务器后即可使用共享资源工具。</p></div>
+    </div>
+    <div class="change">
+      <div class="number">04</div>
+      <div><h3>Headless 与远端工作区</h3><p>Headless 支持从标准输入接收任务，用 <code>--session-id</code> 继续已有会话，用 <code>--json</code> 逐行输出运行事件；扩展文件、命令及 PTC 工具，可通过 SSH 使用远端工作区。</p></div>
+    </div>
+    <div class="change">
+      <div class="number">05</div>
+      <div><h3>实验性 Browser Use</h3><p>新增实验性浏览器操作支持，包含 Playwright MCP、Chrome DevTools MCP 和 Stagehand 浏览器后端。</p></div>
+    </div>
+    <div class="change">
+      <div class="number">06</div>
+      <div><h3>实验性 Computer Use</h3><p>新增实验性本机操作支持，可通过 Cua Driver MCP 或原生驱动操作本机并获取截图。</p></div>
+    </div>
+    <div class="change">
+      <div class="number">07</div>
+      <div><h3>实验性 Auto review</h3><p>新增实验性自动评审模式。</p></div>
+    </div>
+    <div class="change">
+      <div class="number">08</div>
+      <div><h3>流式与文件预览优化</h3><p>文件、Skill 引用及交付文件链接默认由侧边栏预览；预览保留文件树滚动位置，图片和 PDF 随面板适配；Trajectory 支持展开和复制 JSON 字符串、查看 PTC 代码及调用结果。</p></div>
+    </div>
+  </section>
+
+  <section class="section">
+    <h2>DeepSeek Harness 上游更新</h2>
+    <p class="section-intro">以下是从 <code>0.1.2-rc.1</code> 升级到 <code>0.1.5-rc.2</code> 期间，上游版本带来的主要变化。</p>
+    <div class="change">
+      <div class="number">RC</div>
+      <div><h3>DeepSeek-V41-Flash 模型</h3><p>新增 <code>DeepSeek-V41-Flash</code>（<code>deepseek-flash</code>），支持文本、图片及会话历史中的系统提示词更新；显式配置的模型保持优先。</p></div>
+    </div>
+    <div class="change">
+      <div class="number">01</div>
+      <div><h3>通用文件上传与预览</h3><p>Web 支持上传任意类型的通用文件，文件和图片可在同一预览区混排；后台上传显示进度、支持取消，并可在切换会话后继续查看。</p></div>
+    </div>
+    <div class="change">
+      <div class="number">02</div>
+      <div><h3>Sidebar 工作区预览</h3><p>右侧 Sidebar 支持多标签、分栏和全屏，预览 Markdown、代码、HTML、PDF 和图片，并可用默认应用打开或在文件管理器中定位。</p></div>
+    </div>
+    <div class="change">
+      <div class="number">03</div>
+      <div><h3>动态系统提示词与模型探测</h3><p>支持在不破坏 KV Cache 的前提下动态修改系统提示词；自定义 provider 支持 <code>models</code> 对象和 Anthropic 原生模型列表。</p></div>
+    </div>
+    <div class="change">
+      <div class="number">04</div>
+      <div><h3>连接、代理和反馈</h3><p>所有出站请求遵循 <code>HTTP_PROXY</code>、<code>HTTPS_PROXY</code>、<code>ALL_PROXY</code> 和 <code>NO_PROXY</code> 环境变量；Web 断线自动恢复；反馈可独立提交，并支持更清晰的发送/排队状态。</p></div>
+    </div>
+    <div class="change">
+      <div class="number">05</div>
+      <div><h3>Session V3 与开发者 API</h3><p>会话数据升级为 <code>Session V3</code>，旧日志通过相邻版本迁移并保留原文件；Session 生命周期改用 <code>SessionHandle</code>，默认文件工具和插件 API 也同步调整。</p></div>
+    </div>
+    <div class="change">
+      <div class="number">06</div>
+      <div><h3>在应用中打开 Workspace</h3><p>Web 顶栏新增「在应用中打开」，可用已安装的编辑器、IDE、终端或文件管理器打开当前 Workspace；PTC 模式还可展开命令及输出。</p></div>
+    </div>
+  </section>
+
+  <section class="section">
+    <h2>本次升级内容</h2>
+    <div class="change">
+      <div class="number">01</div>
+      <div><h3>dsh 固定到 alpha.1，并补一键升级</h3><p><code>@deepseek-ai/dsh@0.1.6-alpha.1</code>。升级前已实测：首页返回 200，62 个前端资源全部 200，无 404。本机旧版不会再被静默沿用，版本不一致会引导一键升级。</p></div>
+    </div>
+    <div class="change">
+      <div class="number">02</div>
+      <div><h3>兼容新版 Web 认证 URL</h3><p>读取 dsh 启动时生成的一次性 token URL，内嵌页面可正常打开；dsh 自动重启后也会同步新 token。</p></div>
+    </div>
+    <div class="change">
+      <div class="number">03</div>
+      <div><h3>排障与导航安全</h3><p>dsh stderr 落盘；主窗口导航锁定本机 http + 固定端口。</p></div>
+    </div>
+  </section>
+
+  <section class="section">
+    <h2>兼容提醒</h2>
+    <p class="section-intro">本次目标版本处于 <strong>alpha</strong> 通道，上游同时包含若干不再兼容的变更，升级前请留意。</p>
+    <div class="change">
+      <div class="number">!</div>
+      <div><h3>DeepSeek 默认改用 Messages 协议</h3><p>自定义 API 地址保留不变；若曾手动配置旧官方根地址，需移除该配置或改为 <code>https://api.deepseek.com/anthropic</code>。</p></div>
+    </div>
+    <div class="change">
+      <div class="number">!</div>
+      <div><h3>PTC 包名与服务名统一</h3><p>统一为 <code>ptc-runtime</code> 系列，旧名称不再兼容，自定义插件与配置需相应更新。</p></div>
+    </div>
+    <div class="change">
+      <div class="number">!</div>
+      <div><h3>移除内置 E2B 执行后端</h3><p>相关自定义配置需调整；另外默认不再启用 Ralph，需要时请手动启用。</p></div>
+    </div>
+    <div class="tip">此页面展示的是本机实际运行版本，不代表仅写入配置但尚未安装的目标版本。若实际运行版本与目标不一致，请重启应用或重新安装。</div>
+  </section>
+
+  <div class="footer">版本信息来自本地 App 运行态；变更说明随本地安装包发布，不需要联网。</div>
+
+  <script>
+    (function () {
+      const { invoke } = window.__TAURI__.core;
+      const appEl = document.getElementById('app-version');
+      const targetEl = document.getElementById('target-dsh');
+      const runtimeEl = document.getElementById('runtime-dsh');
+
+      function versionOnly(value) {
+        return String(value || '').replace(/^@deepseek-ai\/dsh@/, '');
+      }
+      function escapeHtml(value) {
+        return String(value == null ? '' : value)
+          .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+      }
+
+      invoke('get_version_info').then((info) => {
+        appEl.textContent = info.app_version || '未知';
+        targetEl.textContent = versionOnly(info.target_dsh);
+        runtimeEl.innerHTML = escapeHtml(info.runtime_dsh || '未启动');
+      }).catch(() => {
+        runtimeEl.textContent = '读取失败';
+      });
+    })();
+  </script>
+</body>
+</html>

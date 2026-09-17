@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <title>升级 dsh</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Helvetica Neue", sans-serif;
+      background: #f6f7f9;
+      color: #1f2329;
+      padding: 22px 24px 28px;
+      -webkit-user-select: none;
+      user-select: none;
+    }
+    h1 { font-size: 18px; font-weight: 600; margin-bottom: 4px; }
+    .sub { font-size: 12px; color: #6b7280; margin-bottom: 16px; line-height: 1.5; }
+    .versions {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+      margin-bottom: 14px;
+    }
+    .vcard {
+      background: #fff;
+      border: 1px solid #e5e7eb;
+      border-radius: 10px;
+      padding: 12px 14px;
+    }
+    .vcard .k { font-size: 12px; color: #6b7280; margin-bottom: 4px; }
+    .vcard .v {
+      font-family: "SF Mono", Menlo, Consolas, monospace;
+      font-size: 15px;
+      font-weight: 700;
+      color: #111827;
+      overflow-wrap: anywhere;
+    }
+    .vcard.target { background: #eff6ff; border-color: #bfdbfe; }
+    .vcard.target .v { color: #1d4ed8; }
+    .hint {
+      background: #fffbeb;
+      border: 1px solid #fde68a;
+      color: #92400e;
+      border-radius: 8px;
+      padding: 10px 12px;
+      font-size: 12px;
+      line-height: 1.55;
+      margin-bottom: 14px;
+    }
+    .hint.ok { background: #ecfdf5; border-color: #a7f3d0; color: #047857; }
+    .actions { display: flex; gap: 8px; margin-bottom: 12px; }
+    button {
+      font-size: 13px;
+      border-radius: 6px;
+      padding: 8px 16px;
+      border: 1px solid transparent;
+      cursor: pointer;
+      font-weight: 500;
+    }
+    button:disabled { opacity: .55; cursor: not-allowed; }
+    #upgrade { background: #2563eb; color: #fff; }
+    #upgrade:hover:not(:disabled) { background: #1d4ed8; }
+    #later { background: #fff; color: #1f2329; border-color: #d1d5db; }
+    #later:hover { background: #f3f4f6; }
+    .status { font-size: 13px; min-height: 18px; margin-bottom: 10px; line-height: 1.45; }
+    .status.ok { color: #059669; }
+    .status.fail { color: #dc2626; }
+    #log {
+      display: none;
+      background: #111827;
+      color: #d1d5db;
+      font-family: "SF Mono", Menlo, Consolas, monospace;
+      font-size: 11px;
+      line-height: 1.55;
+      border-radius: 8px;
+      padding: 10px 12px;
+      height: 120px;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      word-break: break-all;
+      -webkit-user-select: text;
+      user-select: text;
+    }
+  </style>
+</head>
+<body>
+  <h1>升级 dsh</h1>
+  <div class="sub">本机实际运行的 dsh 与应用固定的目标版本不一致时，可一键装到目标版本并重启生效。</div>
+
+  <div class="versions">
+    <div class="vcard"><div class="k">当前运行版本</div><div class="v" id="current">读取中…</div></div>
+    <div class="vcard target"><div class="k">目标版本</div><div class="v" id="target">…</div></div>
+  </div>
+
+  <div class="hint" id="hint">正在检测版本…</div>
+
+  <div class="actions">
+    <button id="upgrade" disabled>一键升级</button>
+    <button id="later">稍后再说</button>
+  </div>
+  <div class="status" id="status"></div>
+  <div id="log"></div>
+
+  <script>
+    (function () {
+      const { invoke } = window.__TAURI__.core;
+      const { listen } = window.__TAURI__.event;
+      const currentEl = document.getElementById('current');
+      const targetEl = document.getElementById('target');
+      const hintEl = document.getElementById('hint');
+      const upgradeBtn = document.getElementById('upgrade');
+      const laterBtn = document.getElementById('later');
+      const statusEl = document.getElementById('status');
+      const logEl = document.getElementById('log');
+      let busy = false;
+
+      function setStatus(ok, text) {
+        statusEl.className = 'status ' + (ok ? 'ok' : 'fail');
+        statusEl.textContent = text;
+      }
+
+      function renderInfo(info) {
+        currentEl.textContent = info.current || '未安装';
+        targetEl.textContent = info.target || '—';
+        if (info.needs_upgrade) {
+          hintEl.className = 'hint';
+          hintEl.textContent = '检测到版本不一致。升级会执行 npm 全局安装，可能需要数分钟，并自动重启 dsh（中断当前会话）。';
+          upgradeBtn.disabled = busy;
+        } else {
+          hintEl.className = 'hint ok';
+          hintEl.textContent = '当前已是目标版本，无需升级。';
+          upgradeBtn.disabled = true;
+        }
+        return info;
+      }
+
+      function refresh() {
+        return invoke('get_dsh_upgrade_info').then(renderInfo).catch((e) => {
+          hintEl.className = 'hint';
+          hintEl.textContent = '版本检测失败：' + e;
+          upgradeBtn.disabled = true;
+        });
+      }
+
+      window.__upgradeRefresh = refresh;
+
+      listen('install_log', (event) => {
+        logEl.style.display = 'block';
+        logEl.textContent += String(event.payload || '');
+        logEl.scrollTop = logEl.scrollHeight;
+      });
+
+      upgradeBtn.onclick = function () {
+        if (busy) return;
+        if (!confirm('升级将安装目标版本 dsh 并重启进程，当前会话会中断。继续？')) return;
+        busy = true;
+        upgradeBtn.disabled = true;
+        laterBtn.disabled = true;
+        logEl.textContent = '';
+        logEl.style.display = 'block';
+        setStatus(true, '正在升级，请稍候（需联网）…');
+        invoke('upgrade_dsh').then((r) => {
+          setStatus(!!r.ok, r.message || (r.ok ? '升级完成' : '升级失败'));
+          if (r.version) currentEl.textContent = r.version;
+          return refresh();
+        }).catch((e) => {
+          setStatus(false, String(e));
+        }).finally(() => {
+          busy = false;
+          laterBtn.disabled = false;
+          return refresh().then(() => { /* refresh 会按需启用按钮 */ });
+        });
+      };
+
+      laterBtn.onclick = function () {
+        invoke('close_upgrade_window').catch(() => {});
+      };
+
+      refresh();
+    })();
+  </script>
+</body>
+</html>

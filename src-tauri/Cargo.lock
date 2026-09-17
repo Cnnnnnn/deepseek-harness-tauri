@@ -827,7 +827,7 @@ dependencies = [
 
 [[package]]
 name = "dsh-tauri"
-version = "1.0.7"
+version = "1.0.15"
 dependencies = [
  "libc",
  "serde",
