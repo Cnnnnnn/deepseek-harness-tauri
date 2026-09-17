@@ -124,7 +124,7 @@
         targetEl.textContent = info.target || '—';
         if (info.needs_upgrade) {
           hintEl.className = 'hint';
-          hintEl.textContent = '检测到版本不一致。升级会执行 npm 全局安装，可能需要数分钟，并自动重启 dsh（中断当前会话）。';
+          hintEl.textContent = '检测到版本不一致。升级会执行 npm 全局安装，可能需要数分钟，并自动重启 dsh（中断当前会话）。点「稍后再说」后，对本目标版本不再自动弹出（菜单仍可打开）。';
           upgradeBtn.disabled = busy;
         } else {
           hintEl.className = 'hint ok';
@@ -173,7 +173,7 @@
       };
 
       laterBtn.onclick = function () {
-        invoke('close_upgrade_window').catch(() => {});
+        invoke('close_upgrade_window', { dismiss: true }).catch(() => {});
       };
 
       refresh();

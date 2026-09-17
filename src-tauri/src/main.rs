@@ -5,7 +5,7 @@ use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Mutex, OnceLock};
@@ -892,6 +892,7 @@ fn estimate_cost(model: &str, input: u64, cache_read: u64, output: u64) -> f64 {
 }
 
 // 最佳努力获取 DeepSeek 账户余额（需联网 + ~/.dsh/.credentials.yaml 中的 API Key）
+// API Key 不进进程 argv：写入 0600 临时头文件，用 curl -H @file 读取，结束后立刻删除。
 fn fetch_balance() -> Option<BalanceInfo> {
     let home = std::env::var("HOME").ok()?;
     let cred = PathBuf::from(&home).join(".dsh").join(".credentials.yaml");
@@ -900,17 +901,33 @@ fn fetch_balance() -> Option<BalanceInfo> {
     if key.is_empty() {
         return None;
     }
+    let header_path = std::env::temp_dir().join(format!(
+        "dsh-balance-h-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    if std::fs::write(&header_path, format!("Authorization: Bearer {key}\n")).is_err() {
+        return None;
+    }
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&header_path, std::fs::Permissions::from_mode(0o600));
+    }
     let out = Command::new("curl")
         .args([
             "-sS",
             "-m",
             "10",
             "-H",
-            &format!("Authorization: Bearer {}", key),
+            &format!("@{}", header_path.display()),
             "https://api.deepseek.com/user/balance",
         ])
-        .output()
-        .ok()?;
+        .output();
+    let _ = std::fs::remove_file(&header_path);
+    let out = out.ok()?;
     let body = String::from_utf8_lossy(&out.stdout);
     let v: serde_json::Value = serde_json::from_str(&body).ok()?;
     let infos = v.get("balance_infos")?.as_array()?;
@@ -1335,6 +1352,58 @@ fn dsh_upgrade_info(app: &tauri::AppHandle) -> DshUpgradeInfo {
     }
 }
 
+// ---------- 升级提示「稍后再说」记忆 ----------
+
+fn upgrade_dismiss_path(app: &tauri::AppHandle) -> Option<PathBuf> {
+    app.path()
+        .app_config_dir()
+        .ok()
+        .map(|d| d.join("dsh-upgrade-dismissed"))
+}
+
+fn read_dismissed_target(path: &Path) -> Option<String> {
+    let s = std::fs::read_to_string(path).ok()?;
+    let t = s.trim();
+    if t.is_empty() {
+        None
+    } else {
+        Some(t.to_string())
+    }
+}
+
+fn write_dismissed_target(path: &Path, target: &str) -> Result<(), String> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    std::fs::write(path, target).map_err(|e| e.to_string())
+}
+
+fn load_dismissed_upgrade_target(app: &tauri::AppHandle) -> Option<String> {
+    upgrade_dismiss_path(app).and_then(|p| read_dismissed_target(&p))
+}
+
+fn save_dismissed_upgrade_target(app: &tauri::AppHandle, target: &str) {
+    if let Some(p) = upgrade_dismiss_path(app) {
+        let _ = write_dismissed_target(&p, target);
+    }
+}
+
+fn clear_dismissed_upgrade_target(app: &tauri::AppHandle) {
+    if let Some(p) = upgrade_dismiss_path(app) {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
+/// 仅当需要升级且该目标版本未被「稍后再说」忽略时，才自动弹窗。
+/// 目标版本变了（DSH_PKG 更新）会重新提示。
+fn should_auto_open_upgrade(app: &tauri::AppHandle) -> bool {
+    let info = dsh_upgrade_info(app);
+    if !info.needs_upgrade {
+        return false;
+    }
+    load_dismissed_upgrade_target(app).as_deref() != Some(info.target.as_str())
+}
+
 #[tauri::command]
 fn get_dsh_upgrade_info(app: tauri::AppHandle) -> DshUpgradeInfo {
     dsh_upgrade_info(&app)
@@ -1476,6 +1545,7 @@ fn upgrade_dsh_impl(app: &tauri::AppHandle) -> UpgradeResult {
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.set_title(&format!("DeepSeek Harness · dsh {ver}"));
     }
+    clear_dismissed_upgrade_target(app);
     emit_log(app, &format!("[upgrade] 升级完成，运行版本 {ver}"));
     UpgradeResult {
         ok: true,
@@ -1506,7 +1576,12 @@ async fn upgrade_dsh(app: tauri::AppHandle) -> Result<UpgradeResult, String> {
 }
 
 #[tauri::command]
-fn close_upgrade_window(app: tauri::AppHandle) {
+fn close_upgrade_window(app: tauri::AppHandle, dismiss: bool) {
+    if dismiss {
+        let target = target_dsh_version().to_string();
+        save_dismissed_upgrade_target(&app, &target);
+        emit_log(&app, &format!("[upgrade] 已忽略对目标版本 {target} 的自动升级提示（菜单仍可手动打开）"));
+    }
     if let Some(w) = app.get_webview_window("upgrade") {
         let _ = w.close();
     }
@@ -1758,8 +1833,8 @@ fn main() {
             let result = detect_environment();
             if result.ok {
                 launch_main(app.handle());
-                // 运行版本与 DSH_PKG 不一致时，弹出一键升级（不阻塞主窗口）
-                if dsh_upgrade_info(app.handle()).needs_upgrade {
+                // 版本不一致且该目标未被「稍后再说」时才自动弹；菜单入口不受影响
+                if should_auto_open_upgrade(app.handle()) {
                     open_upgrade_window(app.handle());
                 }
             } else {
@@ -1787,7 +1862,10 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{dsh_url_from_output, navigation_allowed, normalize_version, target_dsh_version, version_info};
+    use super::{
+        dsh_url_from_output, navigation_allowed, normalize_version, read_dismissed_target,
+        target_dsh_version, version_info, write_dismissed_target,
+    };
 
     #[test]
     fn extracts_tokenized_web_url_for_expected_port() {
@@ -1829,6 +1907,32 @@ mod tests {
     }
 
     #[test]
+    fn dismissed_upgrade_target_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("dsh-dismiss-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("dsh-upgrade-dismissed");
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(read_dismissed_target(&path), None);
+
+        write_dismissed_target(&path, "0.1.6-alpha.1").unwrap();
+        assert_eq!(
+            read_dismissed_target(&path).as_deref(),
+            Some("0.1.6-alpha.1")
+        );
+
+        // 目标版本变化后旧忽略记录不应命中
+        assert_ne!(
+            read_dismissed_target(&path).as_deref(),
+            Some("0.1.7-alpha.1")
+        );
+
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(read_dismissed_target(&path), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn version_change_page_documents_current_versions() {
         let page = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../precheck/changelog.html"));
         let info = version_info();
@@ -1845,5 +1949,8 @@ mod tests {
         // 1.0.15：一键升级 + stderr/导航收紧
         assert!(page.contains("一键升级"));
         assert!(page.contains("stderr"));
+        // 1.0.16：升级提示可忽略 + 余额 key 不进 argv
+        assert!(page.contains("稍后再说"));
+        assert!(page.contains("不进进程参数"));
     }
 }

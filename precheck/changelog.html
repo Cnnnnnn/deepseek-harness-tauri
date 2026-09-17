@@ -44,10 +44,23 @@
   <p class="lede">这里记录当前封装版本、实际运行版本，以及最近一次升级带来的变化。</p>
 
   <div class="version-grid">
-    <div class="version-card accent"><div class="label">App 当前版本</div><div class="value" id="app-version">1.0.15</div></div>
+    <div class="version-card accent"><div class="label">App 当前版本</div><div class="value" id="app-version">1.0.16</div></div>
     <div class="version-card"><div class="label">dsh 目标版本</div><div class="value" id="target-dsh">0.1.6-alpha.1</div></div>
     <div class="version-card"><div class="label">dsh 实际运行版本</div><div class="value" id="runtime-dsh">读取中…</div></div>
   </div>
+
+  <section class="section">
+    <h2>1.0.16 封装改进</h2>
+    <p class="section-intro">相对 1.0.15 的日常体验与安全小修。</p>
+    <div class="change">
+      <div class="number">01</div>
+      <div><h3>升级提示可忽略</h3><p>点「稍后再说」后，对同一目标 dsh 版本不再每次启动自动弹窗；菜单「工具 → 升级 dsh…」仍可随时打开。目标版本变更或升级成功后会恢复提示。</p></div>
+    </div>
+    <div class="change">
+      <div class="number">02</div>
+      <div><h3>余额 API Key 不进进程参数</h3><p>查询 DeepSeek 余额时，密钥改为写入 0600 临时头文件供 curl 读取，避免同机 <code>ps</code> 看到 Authorization 头。</p></div>
+    </div>
+  </section>
 
   <section class="section">
     <h2>1.0.15 封装改进</h2>
